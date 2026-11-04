@@ -578,7 +578,16 @@ export const OrdersView: React.FC = () => {
                     )
                   )}
 
-                  {row.auto_renew === 1 ? (
+                  {row.is_activity_expired ? (
+                    <Tooltip
+                      content={`商户活动报名已于 ${row.activity_end_time || '此前'} 截止，此时退单无法重新抢回名额，已自动安全锁定`}
+                      position="top"
+                    >
+                      <Tag color="orange" size="small" shape="square" className="!px-1 !py-0 text-xs cursor-pointer">
+                        活动已截止
+                      </Tag>
+                    </Tooltip>
+                  ) : row.auto_renew === 1 ? (
                     <Tooltip
                       content={row.renew_log || (row.is_final_renew === 1 ? '活动结束前5分钟末次退单重抢' : '下单后110分钟自动退单重抢以重置2小时限制')}
                       position="top"
@@ -738,14 +747,16 @@ export const OrdersView: React.FC = () => {
                     content="系统将立即调用官方接口退单并在几十毫秒内突发重抢以重置2小时倒计时（系统将自动校验饭票，若饭票为0将安全拦截以防止名额丢失）。"
                     okText="确认续期"
                     cancelText="取消"
+                    disabled={Boolean(row.is_activity_expired)}
                     onConfirm={() => handleExecuteRenewNow(row)}
                   >
                     <Button
                       theme="light"
                       type="primary"
                       size="small"
+                      disabled={Boolean(row.is_activity_expired)}
                       loading={renewingOrderId === row.id}
-                      title="立即退单并在毫秒内重抢锁定以重置2小时限制"
+                      title={row.is_activity_expired ? '商户活动报名已截止，无法执行退单重抢' : '立即退单并在毫秒内重抢锁定以重置2小时限制'}
                     >
                       极速续期
                     </Button>
@@ -755,9 +766,10 @@ export const OrdersView: React.FC = () => {
                     theme="light"
                     type={row.auto_renew === 1 ? 'tertiary' : 'secondary'}
                     size="small"
+                    disabled={Boolean(row.is_activity_expired && row.auto_renew !== 1)}
                     loading={togglingRenewOrderId === row.id}
                     onClick={() => handleToggleAutoRenew(row)}
-                    title={row.auto_renew === 1 ? '点击关闭 110 分钟自动续期守护' : '点击开启 110 分钟自动退单重抢守护'}
+                    title={row.is_activity_expired ? '商户活动报名已截止，无法开启续期守护' : (row.auto_renew === 1 ? '点击关闭 110 分钟自动续期守护' : '点击开启 110 分钟自动退单重抢守护')}
                   >
                     {row.auto_renew === 1 ? '关续期' : '开续期'}
                   </Button>

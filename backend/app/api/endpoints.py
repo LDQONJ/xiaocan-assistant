@@ -4500,6 +4500,39 @@ async def list_orders(
         limit=limit,
         offset=offset
     )
+    now_ts = int(time.time())
+    from ..core.appointment_worker import _parse_time_today
+    for ord_item in orders:
+        pp_str = ord_item.get("promotion_params") or "{}"
+        try:
+            pp = json.loads(pp_str) if isinstance(pp_str, str) else pp_str
+        except Exception:
+            pp = {}
+        act_end_ts = int(pp.get("end_date_timestamp") or 0)
+        act_end_time = str(pp.get("end_time") or "").strip()
+        if not act_end_ts and act_end_time:
+            parsed_ts = _parse_time_today(act_end_time)
+            if parsed_ts and parsed_ts > 0:
+                act_end_ts = int(parsed_ts)
+
+        is_act_expired = False
+        if act_end_ts > 0 and now_ts >= act_end_ts:
+            is_act_expired = True
+
+        ord_item["activity_end_time"] = act_end_time
+        ord_item["activity_end_ts"] = act_end_ts
+        ord_item["is_activity_expired"] = is_act_expired
+
+        # 自愈终结：若活动已经截止，本地却还开启着续期守护，自动将其安全终结以防误退单
+        if is_act_expired and ord_item.get("status") == "pending" and ord_item.get("auto_renew") == 1:
+            ord_item["auto_renew"] = 0
+            ord_item["renew_status"] = "terminated"
+            db.update_order_renew_meta(ord_item["id"], {
+                "auto_renew": 0,
+                "renew_status": "terminated",
+                "renew_log": f"[{time.strftime('%H:%M:%S')}] 商户活动报名已截止 ({act_end_time or '此前'})，自动解除续期守护"
+            })
+
     return {"ok": True, "orders": orders, "total": len(orders)}
 
 
@@ -4818,9 +4851,15 @@ async def toggle_order_renew(order_id: int, data: Dict[str, Any] = Body(default=
         promo_params = await ensure_order_promotion_params(target_order, client, account)
         order_time = int(target_order.get("order_time") or 0) or int(time.time())
         end_time = promo_params.get("end_time") or ""
-        sched = calculate_order_renew_schedule(order_time=order_time, activity_end_time_str=end_time)
+        end_ts = int(promo_params.get("end_date_timestamp") or 0)
+        sched = calculate_order_renew_schedule(
+            order_time=order_time,
+            activity_end_time_str=end_time,
+            activity_end_timestamp=end_ts,
+            check_now_ts=int(time.time())
+        )
         if not sched.get("can_renew"):
-            raise HTTPException(status_code=400, detail=sched.get("reason") or "商户活动已临近截止，无法开启续期")
+            raise HTTPException(status_code=400, detail=sched.get("reason") or "商户活动已临近或超过截止时间，无法开启续期")
 
         db.update_order_renew_meta(order_id, {
             "auto_renew": 1,

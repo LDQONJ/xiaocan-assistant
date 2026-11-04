@@ -290,6 +290,9 @@ export interface Order {
   renew_status?: 'idle' | 'scheduled' | 'renewing' | 'success' | 'terminated' | 'failed' | string;
   renew_log?: string;
   promotion_params?: string;
+  activity_end_time?: string;
+  activity_end_ts?: number;
+  is_activity_expired?: boolean;
   created_at: string;
   updated_at?: string;
 }

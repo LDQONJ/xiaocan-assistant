@@ -75,7 +75,7 @@ def invalidate_worker_cache():
 
 
 def _parse_time_today(time_str: str) -> Optional[float]:
-    """解析 HH:MM 为今日的时间戳，若格式为 YYYY-MM-DD HH:MM:SS 或纯数字时间戳则直接解析"""
+    """解析 HH:MM / YYYY-MM-DD HH:MM:SS / 时间戳为秒级时间戳"""
     if not time_str or not str(time_str).strip():
         return None
     time_str = str(time_str).strip()
@@ -88,8 +88,11 @@ def _parse_time_today(time_str: str) -> Optional[float]:
             if val > 1e8:
                 return val
         if "-" in time_str:
-            dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
-            return dt.timestamp()
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"):
+                try:
+                    return datetime.strptime(time_str, fmt).timestamp()
+                except ValueError:
+                    pass
         if ":" in time_str:
             parts = time_str.split(":")
             h, m = int(parts[0]), int(parts[1])
@@ -105,16 +108,18 @@ def calculate_order_renew_schedule(
     order_time: int,
     activity_end_time_str: str = "",
     buffer_seconds: int = 300,
-    check_now_ts: int = 0
+    check_now_ts: int = 0,
+    activity_end_timestamp: int = 0
 ) -> Dict[str, Any]:
     """
     动态计算待下单订单的下一次退单重抢续期时刻。
     核心规则：
     1. 正常续期点：下单时间 + 110 分钟 (6600 秒)；
     2. 安全底线点：商户活动今日结束时刻提前 buffer_seconds (默认 300 秒即 5 分钟)；
-    3. 若正常续期点早于安全底线点：按正常 110 分钟续期，is_final=0；
-    4. 若活动结束较早 (安全底线点 <= 正常续期点)：在活动结束前 5 分钟提前续期，标记 is_final=1 (末次续期，续完后自动终结)；
-    5. 若当前已到达或超过安全底线点：无法安全续期，返回 can_renew=False。
+    3. 若活动已到达或超过截止时间：严禁续期，返回 can_renew=False, is_expired=True；
+    4. 若当前已到达或超过安全底线点 (活动结束前 5 分钟内)：无法安全续期，返回 can_renew=False, is_expired=True；
+    5. 若正常续期点早于安全底线点：按正常 110 分钟续期，is_final=0；
+    6. 若活动结束较早 (安全底线点 <= 正常续期点)：在活动结束前 5 分钟提前续期，标记 is_final=1 (末次续期，续完后自动终结)。
     """
     now_ts = check_now_ts if check_now_ts > 0 else int(time.time())
     if order_time <= 0:
@@ -123,38 +128,55 @@ def calculate_order_renew_schedule(
     normal_target = order_time + 6600
 
     activity_end_ts: Optional[float] = None
-    if activity_end_time_str and str(activity_end_time_str).strip():
+    if activity_end_timestamp > 0:
+        activity_end_ts = float(activity_end_timestamp)
+    elif activity_end_time_str and str(activity_end_time_str).strip():
         activity_end_ts = _parse_time_today(str(activity_end_time_str).strip())
 
-    if not activity_end_ts or activity_end_ts <= 0:
-        now_dt = datetime.fromtimestamp(order_time)
-        end_dt = datetime(now_dt.year, now_dt.month, now_dt.day, 23, 59, 59)
-        activity_end_ts = end_dt.timestamp()
+    if activity_end_ts and activity_end_ts > 0:
+        end_display = time.strftime("%H:%M:%S", time.localtime(activity_end_ts))
+        if now_ts >= activity_end_ts:
+            return {
+                "can_renew": False,
+                "next_renew_ts": 0,
+                "is_final": 0,
+                "is_expired": True,
+                "reason": f"商户活动报名已于 {end_display} 截止，此时退单无法重新抢回名额，严禁退单重抢！"
+            }
+        safe_deadline = int(activity_end_ts) - buffer_seconds
+        if now_ts >= safe_deadline:
+            return {
+                "can_renew": False,
+                "next_renew_ts": 0,
+                "is_final": 0,
+                "is_expired": True,
+                "reason": f"商户活动报名将于 {end_display} 截止 (已不足 5 分钟安全缓冲期)，严禁退单重抢！"
+            }
 
-    safe_deadline = int(activity_end_ts) - buffer_seconds
-
-    if now_ts >= safe_deadline:
-        return {
-            "can_renew": False,
-            "next_renew_ts": 0,
-            "is_final": 0,
-            "reason": "当前已临近或超过商户活动安全截止时间，无法安全执行退单重抢"
-        }
-
-    if normal_target < safe_deadline:
+        if normal_target < safe_deadline:
+            return {
+                "can_renew": True,
+                "next_renew_ts": normal_target,
+                "is_final": 0,
+                "is_expired": False,
+                "reason": "计划在抢单满 110 分钟 (1小时50分) 时自动执行无损退单重抢"
+            }
+        else:
+            return {
+                "can_renew": True,
+                "next_renew_ts": safe_deadline,
+                "is_final": 1,
+                "is_expired": False,
+                "reason": f"商户活动将于 {end_display} 结束，计划在活动结束前 5 分钟执行末次续期守护"
+            }
+    else:
+        # 未能获取到活动截止时间时，默认按 110 分钟排期
         return {
             "can_renew": True,
             "next_renew_ts": normal_target,
             "is_final": 0,
-            "reason": "计划在抢单满 110 分钟 (1小时50分) 时自动执行无损退单重抢"
-        }
-    else:
-        end_display = time.strftime("%H:%M:%S", time.localtime(activity_end_ts))
-        return {
-            "can_renew": True,
-            "next_renew_ts": safe_deadline,
-            "is_final": 1,
-            "reason": f"商户活动将于 {end_display} 结束，计划在活动结束前 5 分钟执行末次续期守护"
+            "is_expired": False,
+            "reason": "计划在抢单满 110 分钟时自动执行无损退单重抢"
         }
 
 
@@ -1144,6 +1166,7 @@ async def ensure_order_promotion_params(
 ) -> Dict[str, Any]:
     """
     自愈探测并补全订单缺失的抢单上下文参数 (兼容历史订单或在微信小程序端手动抢单的订单)
+    重点补齐：promotion_id、官方权威活动截止时间 (end_time & end_date_timestamp)
     """
     params_str = order_record.get("promotion_params") or "{}"
     promo_params: Dict[str, Any] = {}
@@ -1151,9 +1174,6 @@ async def ensure_order_promotion_params(
         promo_params = json.loads(params_str)
     except Exception:
         promo_params = {}
-
-    if promo_params.get("promotion_id"):
-        return promo_params
 
     acc = account
     if not acc:
@@ -1173,6 +1193,44 @@ async def ensure_order_promotion_params(
     store_id_str = str(order_record.get("store_id") or "")
     lat = str(acc.get("latitude") or "22.548361")
     lon = str(acc.get("longitude") or "114.13166")
+
+    async def _enrich_promo_with_detail(p_dict: Dict[str, Any], pid: str) -> Dict[str, Any]:
+        """通过官方 get_store_promotion_detail 补全高精活动截止时间与营业状态"""
+        if not pid or not token:
+            return p_dict
+        try:
+            p_res = await client_inst.get_store_promotion_detail(
+                promotion_id=pid,
+                token=token,
+                silk_id=silk_id,
+                user_id=user_id,
+                city_code=city_code
+            )
+            pd = p_res.get("promotion_detail") or p_res.get("promotion") or {}
+            end_ts = pd.get("end_date_timestamp")
+            if end_ts and int(end_ts) > 0:
+                p_dict["end_date_timestamp"] = int(end_ts)
+            end_h = pd.get("end_time_hour")
+            end_m = pd.get("end_time_minute")
+            end_d = pd.get("end_date")
+            if end_d and end_h is not None and end_m is not None:
+                p_dict["end_time"] = f"{end_d} {int(end_h):02d}:{int(end_m):02d}:00"
+            if pd.get("promotion_status") is not None:
+                p_dict["activity_status"] = pd.get("promotion_status")
+        except Exception as pe:
+            logger.warning(f"自愈补全活动截止时间详情异常: {pe}")
+        return p_dict
+
+    # 若已包含 promotion_id，检查是否已具备权威截止时间戳
+    if promo_params.get("promotion_id"):
+        if not promo_params.get("end_date_timestamp") or not promo_params.get("end_time"):
+            promo_params = await _enrich_promo_with_detail(promo_params, str(promo_params["promotion_id"]))
+            order_db_id = order_record.get("id")
+            if order_db_id:
+                db.update_order_renew_meta(order_db_id, {
+                    "promotion_params": json.dumps(promo_params, ensure_ascii=False)
+                })
+        return promo_params
 
     # 第一级自愈：通过官方 GetPromotionOrderList 反查活动详情
     try:
@@ -1226,12 +1284,13 @@ async def ensure_order_promotion_params(
                     "rebate_type": "percent" if int(order_record.get("order_type") or 0) == 12 else "fixed",
                     "wm_poi_id": wm_poi_id
                 }
+                promo_params = await _enrich_promo_with_detail(promo_params, found_pid)
                 order_db_id = order_record.get("id")
                 if order_db_id:
                     db.update_order_renew_meta(order_db_id, {
                         "promotion_params": json.dumps(promo_params, ensure_ascii=False)
                     })
-                logger.info(f"成功自愈补全订单 #{order_record.get('id')} 的抢单上下文参数: promotion_id={found_pid}")
+                logger.info(f"成功自愈补全订单 #{order_record.get('id')} 的抢单上下文参数: promotion_id={found_pid}, end_time={promo_params.get('end_time')}")
                 return promo_params
     except Exception as e:
         logger.warning(f"订单列表自愈反查失败: {e}")
@@ -1279,15 +1338,18 @@ async def ensure_order_promotion_params(
                         "rebate_type": chosen_p.get("rebate_type") or ("percent" if int(order_record.get("order_type") or 0) == 12 else "fixed"),
                         "wm_poi_id": str(chosen_p.get("wm_poi_id") or matched_store.get("wm_poi_id") or "")
                     }
+                    promo_params = await _enrich_promo_with_detail(promo_params, found_pid)
                     order_db_id = order_record.get("id")
                     if order_db_id:
                         db.update_order_renew_meta(order_db_id, {
                             "promotion_params": json.dumps(promo_params, ensure_ascii=False)
                         })
-                    logger.info(f"成功通过商户在线搜索自愈补全订单 #{order_record.get('id')} 的抢单上下文参数: promotion_id={found_pid}")
+                    logger.info(f"成功通过商户在线搜索自愈补全订单 #{order_record.get('id')} 的抢单上下文参数: promotion_id={found_pid}, end_time={promo_params.get('end_time')}")
                     return promo_params
         except Exception as se:
             logger.warning(f"店铺在线搜索自愈失败: {se}")
+
+    return promo_params
 
     return promo_params
 
@@ -1422,6 +1484,35 @@ async def execute_order_fast_renew(
                 store_name=str(fresh_order.get("store_name") or "")
             )
             pdetail = store_detail.get("promotion_detail") or store_detail.get("promotion") or {}
+            # 补全权威活动截止时间戳与截止时刻
+            act_end_ts = pdetail.get("end_date_timestamp")
+            if act_end_ts and int(act_end_ts) > 0:
+                promo_params["end_date_timestamp"] = int(act_end_ts)
+            end_h = pdetail.get("end_time_hour")
+            end_m = pdetail.get("end_time_minute")
+            end_d = pdetail.get("end_date")
+            if end_d and end_h is not None and end_m is not None:
+                promo_params["end_time"] = f"{end_d} {int(end_h):02d}:{int(end_m):02d}:00"
+
+            # 校验活动是否已截止或已临近截止 (已截止时严禁退单重抢，坚决保全已有订单)
+            sched_check = calculate_order_renew_schedule(
+                order_time=int(fresh_order.get("order_time") or time.time()),
+                activity_end_time_str=promo_params.get("end_time") or "",
+                activity_end_timestamp=int(promo_params.get("end_date_timestamp") or 0),
+                check_now_ts=int(time.time())
+            )
+            if not sched_check.get("can_renew") and sched_check.get("is_expired"):
+                msg = sched_check.get("reason") or "商户活动报名已截止，退单后无法重新抢单，为保护当前订单名额，严禁退单！"
+                log_lines.append(f"[{time_service.format_now_ms()}] {msg}")
+                logger.warning(msg)
+                db.update_order_renew_meta(order_id, {
+                    "auto_renew": 0,
+                    "renew_status": "terminated",
+                    "renew_log": "\n".join(log_lines),
+                    "promotion_params": json.dumps(promo_params, ensure_ascii=False)
+                })
+                return {"ok": False, "message": msg}
+
             # 官方活动状态说明：
             # 1/2: 进行中; 3: 抢完名额为0 (占座抢满正常现象，退单后将释放); 4/5: 商家永久打烊或活动下架
             # 仅当官方明确返回活动已终结下线 (status=4或5) 时才拦截避让
@@ -1432,7 +1523,8 @@ async def execute_order_fast_renew(
                 db.update_order_renew_meta(order_id, {
                     "auto_renew": 0,
                     "renew_status": "terminated",
-                    "renew_log": "\n".join(log_lines)
+                    "renew_log": "\n".join(log_lines),
+                    "promotion_params": json.dumps(promo_params, ensure_ascii=False)
                 })
                 return {"ok": False, "message": msg}
             log_lines.append(f"[{time_service.format_now_ms()}] 步骤 1/4 完成: 商户活动处于有效运营状态 (退单后名额将立即释放回库存池)")
@@ -1546,7 +1638,13 @@ async def execute_order_fast_renew(
 
             # 计算新订单的续期计划 (遵循用户意图：手动点击极速续期与后台自动守护解耦，严格继承原单的 auto_renew 策略)
             activity_end_time = str(promo_params.get("end_time") or "").strip()
-            sched = calculate_order_renew_schedule(order_time=now_ts, activity_end_time_str=activity_end_time, check_now_ts=now_ts)
+            activity_end_ts_val = int(promo_params.get("end_date_timestamp") or 0)
+            sched = calculate_order_renew_schedule(
+                order_time=now_ts,
+                activity_end_time_str=activity_end_time,
+                activity_end_timestamp=activity_end_ts_val,
+                check_now_ts=now_ts
+            )
             was_auto_renew = int(fresh_order.get("auto_renew") or 0) == 1
 
             if was_auto_renew:
