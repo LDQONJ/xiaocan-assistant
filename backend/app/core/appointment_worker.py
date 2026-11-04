@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 import asyncio
+import json
 import logging
 import random
 import re
@@ -98,6 +99,63 @@ def _parse_time_today(time_str: str) -> Optional[float]:
     except Exception as e:
         logger.warning(f"解析时间戳失败 {time_str}: {e}")
     return None
+
+
+def calculate_order_renew_schedule(
+    order_time: int,
+    activity_end_time_str: str = "",
+    buffer_seconds: int = 300,
+    check_now_ts: int = 0
+) -> Dict[str, Any]:
+    """
+    动态计算待下单订单的下一次退单重抢续期时刻。
+    核心规则：
+    1. 正常续期点：下单时间 + 110 分钟 (6600 秒)；
+    2. 安全底线点：商户活动今日结束时刻提前 buffer_seconds (默认 300 秒即 5 分钟)；
+    3. 若正常续期点早于安全底线点：按正常 110 分钟续期，is_final=0；
+    4. 若活动结束较早 (安全底线点 <= 正常续期点)：在活动结束前 5 分钟提前续期，标记 is_final=1 (末次续期，续完后自动终结)；
+    5. 若当前已到达或超过安全底线点：无法安全续期，返回 can_renew=False。
+    """
+    now_ts = check_now_ts if check_now_ts > 0 else int(time.time())
+    if order_time <= 0:
+        order_time = now_ts
+
+    normal_target = order_time + 6600
+
+    activity_end_ts: Optional[float] = None
+    if activity_end_time_str and str(activity_end_time_str).strip():
+        activity_end_ts = _parse_time_today(str(activity_end_time_str).strip())
+
+    if not activity_end_ts or activity_end_ts <= 0:
+        now_dt = datetime.fromtimestamp(order_time)
+        end_dt = datetime(now_dt.year, now_dt.month, now_dt.day, 23, 59, 59)
+        activity_end_ts = end_dt.timestamp()
+
+    safe_deadline = int(activity_end_ts) - buffer_seconds
+
+    if now_ts >= safe_deadline:
+        return {
+            "can_renew": False,
+            "next_renew_ts": 0,
+            "is_final": 0,
+            "reason": "当前已临近或超过商户活动安全截止时间，无法安全执行退单重抢"
+        }
+
+    if normal_target < safe_deadline:
+        return {
+            "can_renew": True,
+            "next_renew_ts": normal_target,
+            "is_final": 0,
+            "reason": "计划在抢单满 110 分钟 (1小时50分) 时自动执行无损退单重抢"
+        }
+    else:
+        end_display = time.strftime("%H:%M:%S", time.localtime(activity_end_ts))
+        return {
+            "can_renew": True,
+            "next_renew_ts": safe_deadline,
+            "is_final": 1,
+            "reason": f"商户活动将于 {end_display} 结束，计划在活动结束前 5 分钟执行末次续期守护"
+        }
 
 
 async def execute_grab_for_appointment(apt: Dict[str, Any], account: Dict[str, Any], advance: bool = False, action_source: str = "store_grab") -> Dict[str, Any]:
@@ -323,7 +381,43 @@ async def execute_grab_for_appointment(apt: Dict[str, Any], account: Dict[str, A
                 now_ts_order = int(time.time())
                 tt_val = now_ts_order + d_time if (is_delayed or raw_d_time > 0) else now_ts_order + 7200
                 exp_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(tt_val))
-                db.save_order({
+
+                # 构建原始抢单上下文快照 (用于后续订单无损续期退单重抢)
+                promo_end_time = str(apt.get("end_time") or apt.get("until_time") or "").strip()
+                promo_params_data = {
+                    "promotion_id": apt["promotion_id"],
+                    "store_id": str(apt.get("store_id") or ""),
+                    "store_name": str(apt.get("store_name") or ""),
+                    "store_icon": str(apt.get("store_icon") or ""),
+                    "platform_code": int(platform_code),
+                    "platform": str(apt.get("platform") or "meituan"),
+                    "end_time": promo_end_time,
+                    "redpack_id": redpack_id,
+                    "order_money": float(apt.get("order_money", 0.0)),
+                    "rebate_price": float(apt.get("rebate_price", 0.0)),
+                    "rebate_desc": str(apt.get("rebate_desc") or ""),
+                    "rebate_type": str(apt.get("rebate_type") or "fixed"),
+                    "wm_poi_id": str(apt.get("wm_poi_id") or "")
+                }
+                promo_params_json = json.dumps(promo_params_data, ensure_ascii=False)
+
+                # 动态计算首次续期计划 (默认开启续期保护，若商家活动早于110分钟则在活动前5分钟末次续期)
+                auto_renew_flag = int(apt.get("auto_renew_order") if apt.get("auto_renew_order") is not None else 1)
+                sched = calculate_order_renew_schedule(order_time=now_ts_order, activity_end_time_str=promo_end_time)
+                if auto_renew_flag and sched.get("can_renew"):
+                    order_auto_renew = 1
+                    order_next_renew_ts = sched["next_renew_ts"]
+                    order_is_final = sched["is_final"]
+                    order_renew_status = "scheduled"
+                    order_renew_log = f"[{time_service.format_now_ms()}] 抢单成功，自动开启无损续期守护: {sched['reason']}"
+                else:
+                    order_auto_renew = 0
+                    order_next_renew_ts = 0
+                    order_is_final = 0
+                    order_renew_status = "idle"
+                    order_renew_log = ""
+
+                saved_ord = db.save_order({
                     "account_key": apt["account_key"],
                     "order_sn": str(res.get("order_id_str") or order_id),
                     "promotion_order_id": order_id,
@@ -340,15 +434,23 @@ async def execute_grab_for_appointment(apt: Dict[str, Any], account: Dict[str, A
                     "order_time": now_ts_order,
                     "timeout_time": tt_val,
                     "expire_time": exp_str,
-                    "delay_count": delay_val
+                    "delay_count": delay_val,
+                    "auto_renew": order_auto_renew,
+                    "renew_count": 0,
+                    "next_renew_ts": order_next_renew_ts,
+                    "is_final_renew": order_is_final,
+                    "renew_status": order_renew_status,
+                    "renew_log": order_renew_log,
+                    "promotion_params": promo_params_json
                 })
             except Exception as oe:
                 logger.warning(f"写入订单记录失败: {oe}")
 
             # 发送系统通知
+            renew_notice_tail = " (已启用 110 分钟自动无损续期守护)" if order_auto_renew else ""
             await send_system_notification(
                 title="小蚕霸王餐抢单成功",
-                content=f"账号【{account.get('nickname')}】已成功抢到【{apt['store_name']}】({apt.get('rebate_desc', '')})，订单号 #{order_id}，请及时在平台下单",
+                content=f"账号【{account.get('nickname')}】已成功抢到【{apt['store_name']}】({apt.get('rebate_desc', '')})，订单号 #{order_id}，请及时在平台下单{renew_notice_tail}",
                 account_key=apt.get("account_key"),
                 event=NotificationEvent.GRAB_SUCCESS,
                 level=NotificationLevel.SUCCESS
@@ -1032,6 +1134,536 @@ async def process_active_appointments() -> Tuple[bool, bool]:
     return has_primed, has_near_minute
 
 
+_renewing_order_ids: Set[int] = set()
+
+
+async def ensure_order_promotion_params(
+    order_record: Dict[str, Any],
+    cli: Optional[XiaoCanClient] = None,
+    account: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    自愈探测并补全订单缺失的抢单上下文参数 (兼容历史订单或在微信小程序端手动抢单的订单)
+    """
+    params_str = order_record.get("promotion_params") or "{}"
+    promo_params: Dict[str, Any] = {}
+    try:
+        promo_params = json.loads(params_str)
+    except Exception:
+        promo_params = {}
+
+    if promo_params.get("promotion_id"):
+        return promo_params
+
+    acc = account
+    if not acc:
+        account_key = order_record.get("account_key")
+        acc = db.get_account_by_key(account_key) if account_key else None
+    if not acc or not acc.get("token"):
+        return promo_params
+
+    client_inst = cli or client
+    token = acc["token"]
+    silk_id = acc.get("silk_id")
+    user_id = acc.get("user_id")
+    city_code = int(acc.get("city_code") or 440303)
+    target_promo_order_id = int(order_record.get("promotion_order_id") or 0)
+    target_sn = str(order_record.get("order_sn") or "")
+    store_name_str = str(order_record.get("store_name") or "")
+    store_id_str = str(order_record.get("store_id") or "")
+    lat = str(acc.get("latitude") or "22.548361")
+    lon = str(acc.get("longitude") or "114.13166")
+
+    # 第一级自愈：通过官方 GetPromotionOrderList 反查活动详情
+    try:
+        rpc_res = await client_inst.get_order_list(
+            token=token,
+            silk_id=silk_id,
+            user_id=user_id,
+            order_status=99,
+            offset=0,
+            number=30,
+            city_code=city_code
+        )
+        raw_orders = rpc_res.get("order_list") or rpc_res.get("orders") or []
+        matched_raw = None
+        for o in raw_orders:
+            p_oid = int(o.get("promotion_order_id") or 0)
+            o_sn = str(o.get("order_id_str") or o.get("promotion_order_id") or "")
+            if (target_promo_order_id > 0 and p_oid == target_promo_order_id) or (target_sn and o_sn == target_sn):
+                matched_raw = o
+                break
+
+        if matched_raw:
+            sp = matched_raw.get("store_promotion") or {}
+            st_obj = sp.get("store") or {}
+            found_pid = str(
+                sp.get("promotion_id")
+                or matched_raw.get("promotion_id")
+                or sp.get("id")
+                or ""
+            )
+            store_id = str(st_obj.get("store_id") or sp.get("store_id") or store_id_str or "")
+            store_name = str(st_obj.get("name") or sp.get("store_name") or store_name_str or "")
+            plat_code = int(matched_raw.get("store_platform") or sp.get("store_platform") or (1 if order_record.get("platform") == "meituan" else 2))
+            end_time = str(sp.get("end_time") or matched_raw.get("end_time") or "")
+            redpack_id = matched_raw.get("redpack_id") or matched_raw.get("user_redpack_id")
+            wm_poi_id = str(sp.get("wm_poi_id") or st_obj.get("wm_poi_id") or "")
+
+            if found_pid:
+                promo_params = {
+                    "promotion_id": found_pid,
+                    "store_id": store_id,
+                    "store_name": store_name,
+                    "store_icon": order_record.get("store_icon") or "",
+                    "platform_code": plat_code,
+                    "platform": order_record.get("platform", "meituan"),
+                    "end_time": end_time,
+                    "redpack_id": redpack_id,
+                    "order_money": float(order_record.get("order_money", 0.0)),
+                    "rebate_price": float(order_record.get("rebate_money", 0.0)),
+                    "rebate_desc": order_record.get("condition") or "",
+                    "rebate_type": "percent" if int(order_record.get("order_type") or 0) == 12 else "fixed",
+                    "wm_poi_id": wm_poi_id
+                }
+                order_db_id = order_record.get("id")
+                if order_db_id:
+                    db.update_order_renew_meta(order_db_id, {
+                        "promotion_params": json.dumps(promo_params, ensure_ascii=False)
+                    })
+                logger.info(f"成功自愈补全订单 #{order_record.get('id')} 的抢单上下文参数: promotion_id={found_pid}")
+                return promo_params
+    except Exception as e:
+        logger.warning(f"订单列表自愈反查失败: {e}")
+
+    # 第二级自愈：根据 store_name / store_id 实时在线检索店铺活动
+    if store_name_str:
+        try:
+            s_res = await client_inst.search_stores(
+                keyword=store_name_str,
+                city_code=city_code,
+                longitude=lon,
+                latitude=lat,
+                token=token,
+                silk_id=silk_id,
+                user_id=user_id,
+                limit=10
+            )
+            store_list = s_res.get("store_list") or s_res.get("stores") or []
+            matched_store = None
+            for s in store_list:
+                sid = str(s.get("store_id") or s.get("id") or "")
+                sname = str(s.get("name") or s.get("store_name") or "")
+                if (store_id_str and sid == store_id_str) or (sname and (sname in store_name_str or store_name_str in sname)):
+                    matched_store = s
+                    break
+
+            if matched_store:
+                promos = matched_store.get("promotions") or []
+                chosen_p = promos[0] if promos else None
+                if chosen_p and chosen_p.get("promotion_id"):
+                    found_pid = str(chosen_p["promotion_id"])
+                    plat_code = int(chosen_p.get("store_platform") or matched_store.get("store_platform") or (1 if order_record.get("platform") == "meituan" else 2))
+                    promo_params = {
+                        "promotion_id": found_pid,
+                        "store_id": str(matched_store.get("store_id") or store_id_str),
+                        "store_name": str(matched_store.get("name") or store_name_str),
+                        "store_icon": order_record.get("store_icon") or matched_store.get("icon") or "",
+                        "platform_code": plat_code,
+                        "platform": order_record.get("platform", "meituan"),
+                        "end_time": str(chosen_p.get("end_time") or ""),
+                        "redpack_id": None,
+                        "order_money": float(chosen_p.get("order_money", order_record.get("order_money", 0.0))),
+                        "rebate_price": float(chosen_p.get("rebate_price", order_record.get("rebate_money", 0.0))),
+                        "rebate_desc": chosen_p.get("rebate_desc") or order_record.get("condition") or "",
+                        "rebate_type": chosen_p.get("rebate_type") or ("percent" if int(order_record.get("order_type") or 0) == 12 else "fixed"),
+                        "wm_poi_id": str(chosen_p.get("wm_poi_id") or matched_store.get("wm_poi_id") or "")
+                    }
+                    order_db_id = order_record.get("id")
+                    if order_db_id:
+                        db.update_order_renew_meta(order_db_id, {
+                            "promotion_params": json.dumps(promo_params, ensure_ascii=False)
+                        })
+                    logger.info(f"成功通过商户在线搜索自愈补全订单 #{order_record.get('id')} 的抢单上下文参数: promotion_id={found_pid}")
+                    return promo_params
+        except Exception as se:
+            logger.warning(f"店铺在线搜索自愈失败: {se}")
+
+    return promo_params
+
+
+async def check_account_meal_ticket_count(
+    cli: XiaoCanClient,
+    account: Dict[str, Any]
+) -> int:
+    """
+    检查账号当前未使用的可用饭票数量 (status=0)。
+    核心安全指标：小蚕规则规定抢单报名必须消耗饭票，若饭票为 0 则无法报名。
+    返回可用饭票张数。若网络异常或未能获取返回 -1。
+    """
+    token = account.get("token")
+    silk_id = account.get("silk_id")
+    user_id = account.get("user_id")
+    city_code = int(account.get("city_code") or 440303)
+    if not token:
+        return 0
+    try:
+        res = await cli.get_user_card_list(
+            token=token,
+            silk_id=silk_id,
+            user_id=user_id,
+            city_code=city_code,
+            status=0,
+            offset=0,
+            number=100
+        )
+        card_items = res.get("list") or []
+        count = 0
+        for it in card_items:
+            card = it.get("card") or {}
+            cname = str(card.get("name") or "").strip()
+            ctype = card.get("card_type")
+            if "饭票" in cname or ctype == 0:
+                count += 1
+        return count
+    except Exception as e:
+        logger.warning(f"检查账号可用饭票数量异常: {e}")
+        return -1
+
+
+async def execute_order_fast_renew(
+    order_record: Dict[str, Any],
+    caller_client: Optional[XiaoCanClient] = None,
+    action_source: str = "auto_renew"
+) -> Dict[str, Any]:
+    """
+    执行订单极限毫秒级退单与突发重抢续期 (原子执行)
+    核心针对用户痛点：
+    1. 连接保活与预计算报文，将退单到重抢的时间间隙压缩至 50~150ms；
+    2. 若首发未命中库存，以 30ms 极微延迟追加 3 次突发连击，防止被他人截胡；
+    3. 成功后重新计算下一次续期；若本次是末次续期，成功后自动终结守护并提醒用户。
+    """
+    order_id = int(order_record.get("id") or 0)
+    promo_order_id = int(order_record.get("promotion_order_id") or 0)
+    if not order_id or not promo_order_id:
+        return {"ok": False, "message": "无效订单编号"}
+
+    if order_id in _renewing_order_ids:
+        return {"ok": False, "message": "该订单正在执行续期重抢中，请勿重复操作"}
+
+    _renewing_order_ids.add(order_id)
+    cli = caller_client or client
+    log_lines = []
+    t_start = time_service.format_now_ms()
+    log_lines.append(f"[{t_start}] 启动订单极限毫秒续期守护流程 (原小蚕单号 #{promo_order_id})")
+
+    try:
+        # 1. 严格前置安全校验 A: 检查美团端是否已绑定单号
+        fresh_order = db.get_order_by_id(order_id) or order_record
+        if fresh_order.get("platform_order_id"):
+            db.update_order_renew_meta(order_id, {
+                "auto_renew": 0,
+                "renew_status": "terminated",
+                "renew_log": f"[{time_service.format_now_ms()}] 美团端已绑定外卖单号 ({fresh_order.get('platform_order_id')})，续期守护已安全终结"
+            })
+            return {"ok": False, "message": "订单已在美团下单绑定外卖单号，自动解除续期守护"}
+
+        if fresh_order.get("status") != "pending":
+            db.update_order_renew_meta(order_id, {
+                "auto_renew": 0,
+                "renew_status": "terminated",
+                "renew_log": f"[{time_service.format_now_ms()}] 订单状态非待下单 ({fresh_order.get('status')})，续期守护已终结"
+            })
+            return {"ok": False, "message": f"订单状态已变更为 {fresh_order.get('status')}，无需续期"}
+
+        account_key = fresh_order.get("account_key")
+        account = db.get_account_by_key(account_key)
+        if not account or not account.get("token"):
+            db.update_order_renew_meta(order_id, {
+                "renew_status": "failed",
+                "renew_log": f"[{time_service.format_now_ms()}] 账号凭据失效或已退出，续期失败"
+            })
+            return {"ok": False, "message": "账号已失效或退出"}
+
+        token = account["token"]
+        silk_id = account.get("silk_id")
+        user_id = account.get("user_id")
+        city_code = int(account.get("city_code") or 440303)
+        lat = str(account.get("latitude") or "22.548361")
+        lon = str(account.get("longitude") or "114.13166")
+
+        # 2. 前置安全校验 B: 解析原始抢单参数 (若缺失则启动在线双重自愈补全)
+        promo_params = await ensure_order_promotion_params(fresh_order, cli, account)
+        promotion_id = promo_params.get("promotion_id")
+        if not promotion_id:
+            db.update_order_renew_meta(order_id, {
+                "renew_status": "failed",
+                "renew_log": f"[{time_service.format_now_ms()}] 无法获取该订单关联的活动编号 (promotion_id)，商户活动可能已下架"
+            })
+            return {"ok": False, "message": "无法自愈获取该订单关联的活动编号，商户活动可能已下架"}
+
+        # 标记为执行中
+        db.update_order_renew_meta(order_id, {
+            "renew_status": "renewing",
+            "renew_log": f"[{time_service.format_now_ms()}] 正在执行极速退单与毫秒重抢..."
+        })
+
+        # 3. 校验商户活动是否依然有效 (避免退单后活动已下线导致无法抢回)
+        log_lines.append(f"[{time_service.format_now_ms()}] 步骤 1/4: 预检商户活动有效性 (promotion_id={promotion_id})")
+        try:
+            store_detail = await cli.get_store_promotion_detail(
+                promotion_id=promotion_id,
+                token=token,
+                silk_id=silk_id,
+                user_id=user_id,
+                city_code=city_code,
+                latitude=float(lat),
+                longitude=float(lon),
+                store_name=str(fresh_order.get("store_name") or "")
+            )
+            pdetail = store_detail.get("promotion_detail") or store_detail.get("promotion") or {}
+            # 官方活动状态说明：
+            # 1/2: 进行中; 3: 抢完名额为0 (占座抢满正常现象，退单后将释放); 4/5: 商家永久打烊或活动下架
+            # 仅当官方明确返回活动已终结下线 (status=4或5) 时才拦截避让
+            status_code = pdetail.get("status")
+            if status_code is not None and int(status_code) in (4, 5):
+                msg = f"商户活动官方已明确下线结束 (status={status_code})，为保护当前订单名额，严禁退单！"
+                log_lines.append(f"[{time_service.format_now_ms()}] {msg}")
+                db.update_order_renew_meta(order_id, {
+                    "auto_renew": 0,
+                    "renew_status": "terminated",
+                    "renew_log": "\n".join(log_lines)
+                })
+                return {"ok": False, "message": msg}
+            log_lines.append(f"[{time_service.format_now_ms()}] 步骤 1/4 完成: 商户活动处于有效运营状态 (退单后名额将立即释放回库存池)")
+        except Exception as pe:
+            logger.warning(f"预检活动状态探测非致命异常: {pe}")
+            log_lines.append(f"[{time_service.format_now_ms()}] 步骤 1/4 提示: 活动预检轻微网络抖动 ({pe})，按计划继续执行极速续期")
+
+        # 3.2 核心风控红线预检: 校验账号可用饭票余额
+        # 平台硬性规则：饭票数为 0 时无法报名抢单。若贸然取消原单将导致重抢失败而痛失名额，必须安全避让拦截！
+        log_lines.append(f"[{time_service.format_now_ms()}] 步骤 1/4 (安全核验): 正在校验账号可用饭票配额...")
+        meal_ticket_count = await check_account_meal_ticket_count(cli, account)
+        if meal_ticket_count == 0:
+            ticket_warn_msg = f"账号【{account.get('nickname')}】可用饭票数量为 0！根据小蚕规则饭票为 0 无法报名抢单。为防止取消后因缺少饭票导致重抢失败痛失名额，系统已安全避让并保留原订单！"
+            log_lines.append(f"[{time_service.format_now_ms()}] {ticket_warn_msg}")
+            logger.warning(ticket_warn_msg)
+            db.update_order_renew_meta(order_id, {
+                "auto_renew": 0,
+                "renew_status": "insufficient_ticket",
+                "renew_log": "\n".join(log_lines)
+            })
+            await send_system_notification(
+                title="霸王餐续期安全避让",
+                content=f"账号【{account.get('nickname')}】订单【{fresh_order.get('store_name')}】可用饭票数量为 0，系统已主动拦截退单续期以保护名额，请前往小蚕做任务领取饭票。",
+                account_key=account_key,
+                event=NotificationEvent.SYSTEM_ALERT,
+                level=NotificationLevel.WARNING
+            )
+            return {"ok": False, "message": "当前账号可用饭票为 0，无法重新抢单。为保护名额已安全拦截退单"}
+        elif meal_ticket_count > 0:
+            log_lines.append(f"[{time_service.format_now_ms()}] 步骤 1/4 (安全核验通过): 账号持有 {meal_ticket_count} 张可用饭票，具备抢单资格")
+        else:
+            log_lines.append(f"[{time_service.format_now_ms()}] 步骤 1/4 (安全核验提示): 饭票配额探测轻微网络抖动，按计划推进")
+
+        # 4. 步骤 2: 发起极速退单 (CancelPromotionQuota)
+        log_lines.append(f"[{time_service.format_now_ms()}] 步骤 2/4: 发射官方 SilkwormService.CancelPromotionQuota 取消原订单 #{promo_order_id}")
+        t_cancel_req = time.time()
+        try:
+            cancel_res = await cli.cancel_promotion_quota(
+                promotion_order_id=promo_order_id,
+                token=token,
+                silk_id=silk_id,
+                user_id=user_id,
+                city_code=city_code
+            )
+        except Exception as ce:
+            err_msg = f"调用取消接口异常: {ce}，原订单保持有效，未造成名额损失"
+            log_lines.append(f"[{time_service.format_now_ms()}] {err_msg}")
+            db.update_order_renew_meta(order_id, {
+                "renew_status": "failed",
+                "renew_log": "\n".join(log_lines)
+            })
+            return {"ok": False, "message": err_msg}
+
+        t_cancel_done = time.time()
+        cancel_duration_ms = (t_cancel_done - t_cancel_req) * 1000
+        log_lines.append(f"[{time_service.format_now_ms()}] 步骤 2/4 完成: 官方退单成功 (耗时 {cancel_duration_ms:.1f}ms)，名额已释放回库存池")
+
+        # 5. 步骤 3: 零延时突发抢回名额
+        log_lines.append(f"[{time_service.format_now_ms()}] 步骤 3/4: 零延时直连开火，发起突发毫秒重抢！")
+        platform_code = int(promo_params.get("platform_code") or 1)
+        redpack_id = promo_params.get("redpack_id")
+        grab_ok = False
+        new_promo_order_id = 0
+        last_grab_msg = ""
+
+        # 连击锁单：最多尝试 3 次，间隔 30ms，消除网络与库存微秒抖动
+        for try_idx in range(1, 4):
+            t_burst = time_service.format_now_ms()
+            try:
+                grab_res = await cli.grab_promotion_quota(
+                    promotion_id=promotion_id,
+                    token=token,
+                    silk_id=silk_id,
+                    user_id=user_id,
+                    city_code=city_code,
+                    store_platform=platform_code,
+                    if_advance_order=False,
+                    latitude=lat,
+                    longitude=lon,
+                    redpack_id=redpack_id,
+                    store_id=str(promo_params.get("store_id") or ""),
+                    store_name=str(fresh_order.get("store_name") or ""),
+                    wm_poi_id=str(promo_params.get("wm_poi_id") or "")
+                )
+                ret_order_id = grab_res.get("promotion_order_id") or (grab_res.get("order") or {}).get("promotion_order_id") or 0
+                if int(ret_order_id) > 0:
+                    new_promo_order_id = int(ret_order_id)
+                    grab_ok = True
+                    log_lines.append(f"[{t_burst}] 突发连击第 {try_idx} 次命中！成功锁定新订单 #{new_promo_order_id}")
+                    break
+                else:
+                    last_grab_msg = grab_res.get("message") or grab_res.get("msg") or "名额暂未释放"
+                    log_lines.append(f"[{t_burst}] 突发第 {try_idx} 次反馈: {last_grab_msg}，立即以 30ms 极微延迟追加连击...")
+            except Exception as ge:
+                last_grab_msg = str(ge)
+                log_lines.append(f"[{t_burst}] 突发第 {try_idx} 次异常: {ge}")
+            await asyncio.sleep(0.03)
+
+        # 6. 步骤 4: 结果落盘与状态流转
+        now_ts = int(time.time())
+        old_renew_count = int(fresh_order.get("renew_count") or 0)
+        is_final_was = int(fresh_order.get("is_final_renew") or 0)
+
+        if grab_ok:
+            log_lines.append(f"[{time_service.format_now_ms()}] 步骤 4/4: 续期成功，正在落盘新订单并维护续期计划")
+            db.update_order(order_id, {
+                "status": "cancelled",
+                "renew_status": "success",
+                "renew_log": "\n".join(log_lines) + f"\n[{time_service.format_now_ms()}] 已由新订单 #{new_promo_order_id} 平滑替换"
+            })
+
+            # 计算新订单的续期计划 (遵循用户意图：手动点击极速续期与后台自动守护解耦，严格继承原单的 auto_renew 策略)
+            activity_end_time = str(promo_params.get("end_time") or "").strip()
+            sched = calculate_order_renew_schedule(order_time=now_ts, activity_end_time_str=activity_end_time, check_now_ts=now_ts)
+            was_auto_renew = int(fresh_order.get("auto_renew") or 0) == 1
+
+            if was_auto_renew:
+                if is_final_was == 1 or not sched.get("can_renew") or sched.get("is_final") == 1:
+                    new_auto_renew = 0
+                    new_renew_status = "terminated"
+                    new_next_renew_ts = 0
+                    new_is_final = 1
+                    final_notice_tail = "【活动末次续期已完成】本次已是商户活动结束前最后一次续期，后续请在截止时间前及时消费并在美团下单！"
+                else:
+                    new_auto_renew = 1
+                    new_renew_status = "scheduled"
+                    new_next_renew_ts = sched["next_renew_ts"]
+                    new_is_final = sched["is_final"]
+                    final_notice_tail = f"已重置 2 小时违约倒计时，自动守护中，下次计划续期时刻: {time.strftime('%H:%M:%S', time.localtime(new_next_renew_ts))}"
+            else:
+                # 原单未开启自动守护：手动点击“极速续期”后，保持未开启自动守护状态，实现手动与自动解耦
+                new_auto_renew = 0
+                new_renew_status = "idle"
+                new_next_renew_ts = 0
+                new_is_final = 0
+                final_notice_tail = "单次极速续期成功，已重置 2 小时违约倒计时。当前未开启自动守护，如需后台自动续期可随时开启【开续期】。"
+
+            new_exp_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_ts + 7200))
+            new_order_data = dict(fresh_order)
+            new_order_data.pop("id", None)
+            new_order_data.update({
+                "order_sn": str(new_promo_order_id),
+                "promotion_order_id": new_promo_order_id,
+                "platform_order_id": "",
+                "status": "pending",
+                "order_time": now_ts,
+                "timeout_time": now_ts + 7200,
+                "expire_time": new_exp_str,
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_ts)),
+                "auto_renew": new_auto_renew,
+                "renew_count": old_renew_count + 1,
+                "next_renew_ts": new_next_renew_ts,
+                "is_final_renew": new_is_final,
+                "renew_status": new_renew_status,
+                "renew_log": f"[{time_service.format_now_ms()}] 继自原订单 #{promo_order_id} 极速续期成功 (第 {old_renew_count + 1} 次续期)\n{final_notice_tail}",
+                "promotion_params": json.dumps(promo_params, ensure_ascii=False)
+            })
+            saved_new = db.save_order(new_order_data)
+
+            await send_system_notification(
+                title="霸王餐订单自动续期成功",
+                content=f"账号【{account.get('nickname')}】店铺【{fresh_order.get('store_name')}】已成功退单并毫秒重抢！新订单号 #{new_promo_order_id}。\n{final_notice_tail}",
+                account_key=account_key,
+                event=NotificationEvent.GRAB_SUCCESS,
+                level=NotificationLevel.SUCCESS
+            )
+            return {
+                "ok": True,
+                "message": f"极速续期成功！新单号 #{new_promo_order_id}",
+                "new_order_id": new_promo_order_id,
+                "order_db_id": saved_new.get("id") if saved_new else None
+            }
+        else:
+            salvage_msg = f"警报: 原订单 #{promo_order_id} 退单后突发重抢未命中 ({last_grab_msg})，系统已自适应挂载 3 秒名额高频捡漏监听引擎！"
+            log_lines.append(f"[{time_service.format_now_ms()}] {salvage_msg}")
+            logger.error(salvage_msg)
+
+            try:
+                db.add_appointment({
+                    "account_key": account_key,
+                    "store_id": str(fresh_order.get("store_id") or ""),
+                    "store_name": str(fresh_order.get("store_name") or ""),
+                    "promotion_id": promotion_id,
+                    "platform": fresh_order.get("platform", "meituan"),
+                    "task_type": "restock",
+                    "status": "monitoring",
+                    "until_time": promo_params.get("end_time") or "23:59",
+                    "check_interval": 3,
+                    "order_money": float(fresh_order.get("order_money", 0)),
+                    "rebate_price": float(fresh_order.get("rebate_money", 0)),
+                    "redpack_id": str(promo_params.get("redpack_id") or "")
+                })
+                invalidate_worker_cache()
+            except Exception as se:
+                logger.warning(f"挂载紧急捡漏任务失败: {se}")
+
+            db.update_order(order_id, {
+                "renew_status": "failed",
+                "renew_log": "\n".join(log_lines)
+            })
+
+            await send_system_notification(
+                title="霸王餐自动续期未命中预警",
+                content=f"账号【{account.get('nickname')}】店铺【{fresh_order.get('store_name')}】退单重抢时名额疑被外部截胡，系统已为您自动启动 3 秒实时捡漏监听！",
+                account_key=account_key,
+                event=NotificationEvent.SYSTEM_ERROR,
+                level=NotificationLevel.ERROR
+            )
+            return {"ok": False, "message": salvage_msg}
+
+    finally:
+        _renewing_order_ids.discard(order_id)
+
+
+async def process_active_order_renews() -> bool:
+    """
+    后台常驻巡检订单自动续期任务：
+    1. 扫描已到达预定续期时刻的有效订单，毫秒级唤醒并执行原子退单重抢；
+    2. 返回是否有 15 秒内即将触发的订单 (用于动态提升调度器主循环精度至 50ms)。
+    """
+    now_ts = int(time.time())
+    due_orders = db.get_renewable_orders(now_ts)
+    for ord_row in due_orders:
+        oid = ord_row.get("id")
+        if oid and oid not in _renewing_order_ids:
+            asyncio.create_task(execute_order_fast_renew(ord_row))
+
+    imminent_orders = db.get_imminent_renew_orders(lookahead_seconds=15)
+    return len(imminent_orders) > 0
+
+
 async def _appointment_loop():
     """后台常驻循环：常态 0.5s 低功耗，临近秒杀或整分准点放单时自适应 20ms~50ms 超高精度监测"""
     logger.info("霸王餐预约与名额监听引擎已启动")
@@ -1044,9 +1676,18 @@ async def _appointment_loop():
             logger.error(f"预约监听主循环发生未捕获异常: {e}")
             has_primed, has_near_minute = False, False
 
+        has_renew_primed = False
+        try:
+            has_renew_primed = await process_active_order_renews()
+        except asyncio.CancelledError:
+            break
+        except Exception as re:
+            logger.error(f"订单自动续期巡检发生未捕获异常: {re}")
+            has_renew_primed = False
+
         if has_primed:
             await asyncio.sleep(0.02)
-        elif has_near_minute:
+        elif has_near_minute or has_renew_primed:
             await asyncio.sleep(0.05)
         else:
             await asyncio.sleep(0.5)

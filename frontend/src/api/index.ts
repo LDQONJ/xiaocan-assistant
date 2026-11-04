@@ -135,7 +135,7 @@ export const api = {
       stores: StoreItem[];
       message?: string;
     }>('/store/dual-rebate-scan', { params, timeout: 120000 }).then(r => r.data),
-  grabStoreNow: (data: { account_key: string; store_id?: string; store_name?: string; store_icon?: string; promotion_id: string; platform?: string; order_money?: number; rebate_price?: number; rebate_desc?: string; rebate_type?: string; advance?: boolean; redpack_id?: string; redpack_name?: string; redpack_mode?: number }) =>
+  grabStoreNow: (data: { account_key: string; store_id?: string; store_name?: string; store_icon?: string; promotion_id: string; platform?: string; order_money?: number; rebate_price?: number; rebate_desc?: string; rebate_type?: string; advance?: boolean; redpack_id?: string; redpack_name?: string; redpack_mode?: number; end_time?: string; auto_renew_order?: number }) =>
     client.post<{ ok: boolean; order_id?: number; can_monitor?: boolean; message: string }>('/store/grab-now', data).then(r => r.data),
   createAppointment: (data: Partial<StoreAppointment>) => client.post<{ ok: boolean; appointment_id: number; message: string }>('/store/appoint', data).then(r => r.data),
   createNameMonitor: (data: NameMonitorPayload) =>
@@ -179,6 +179,10 @@ export const api = {
   useDelayCard: (id: number, count: number) => client.post<{ ok: boolean; message: string; timeout_time: number; expire_time: string; delay_card_used_count: number }>(`/orders/${id}/use-delay-card`, { count }).then(r => r.data),
   cancelOrder: (id: number) =>
     client.post<{ ok: boolean; message: string; raw?: any }>(`/orders/${id}/cancel`).then(r => r.data),
+  toggleOrderAutoRenew: (id: number, autoRenew?: boolean) =>
+    client.post<{ ok: boolean; message: string; auto_renew: number; next_renew_ts: number; is_final?: number }>(`/orders/${id}/toggle-renew`, { auto_renew: autoRenew ? 1 : 0 }).then(r => r.data),
+  executeOrderRenewNow: (id: number) =>
+    client.post<{ ok: boolean; message: string; new_order_id?: number }>(`/orders/${id}/execute-renew-now`).then(r => r.data),
   deleteOrder: (id: number) => 
     client.delete<{ ok: boolean; message: string }>(`/orders/${id}`).then(r => r.data),
 

@@ -1407,6 +1407,8 @@ export const StoreSniping: React.FC = () => {
         rebate_price: targetPromo.rebate_price,
         rebate_desc: targetPromo.rebate_desc,
         rebate_type: targetPromo.rebate_type || store.rebate_type,
+        end_time: targetPromo.end_time || '',
+        auto_renew_order: 1,
         advance: advance
       });
 
@@ -1473,7 +1475,8 @@ export const StoreSniping: React.FC = () => {
         redpack_mode: rpMode,
         redpack_id: chosenRpId,
         redpack_name: chosenRpName,
-        use_advance_card: values.use_advance_card ? 1 : 0
+        use_advance_card: values.use_advance_card ? 1 : 0,
+        auto_renew_order: 1
       });
 
       Toast.success(isMonitor ? `已开启【${cleanEmoji(selectedStore.name)}】名额监听任务` : `店铺【${cleanEmoji(selectedStore.name)}】已加入定时预约抢单队列`);
@@ -1531,7 +1534,8 @@ export const StoreSniping: React.FC = () => {
         redpack_mode: rpMode,
         redpack_id: chosenRpId,
         redpack_name: chosenRpName,
-        use_advance_card: values.use_advance_card ? 1 : 0
+        use_advance_card: values.use_advance_card ? 1 : 0,
+        auto_renew_order: 1
       });
 
       if (res.ok) {

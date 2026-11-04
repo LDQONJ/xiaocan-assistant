@@ -3768,7 +3768,10 @@ async def grab_store_now(data: Dict[str, Any] = Body(...)):
         "rebate_type": str(data.get("rebate_type") or ""),
         "redpack_mode": int(data.get("redpack_mode", 0)),
         "redpack_id": data.get("redpack_id"),
-        "redpack_name": data.get("redpack_name", "")
+        "redpack_name": data.get("redpack_name", ""),
+        "end_time": str(data.get("end_time") or ""),
+        "until_time": str(data.get("until_time") or ""),
+        "auto_renew_order": int(data.get("auto_renew_order") if data.get("auto_renew_order") is not None else 1)
     }
 
     res = await execute_grab_for_appointment(apt_data, account, advance=bool(data.get("advance", False)), action_source="store_grab")
@@ -4425,6 +4428,26 @@ async def list_orders(
             )
             delay_count_val = 1 if is_delayed_reward else 0
 
+            sync_promo_id = str(promo.get("promotion_id") or o.get("promotion_id") or promo.get("id") or "")
+            sync_end_time = str(promo.get("end_time") or o.get("end_time") or "")
+            sync_promo_params_json = ""
+            if sync_promo_id:
+                sync_promo_params_json = json.dumps({
+                    "promotion_id": sync_promo_id,
+                    "store_id": store_id,
+                    "store_name": _clean_emoji(store_name),
+                    "store_icon": store_icon,
+                    "platform_code": sp or 1,
+                    "platform": order_platform,
+                    "end_time": sync_end_time,
+                    "redpack_id": o.get("redpack_id") or o.get("user_redpack_id"),
+                    "order_money": order_money,
+                    "rebate_price": rebate_money,
+                    "rebate_desc": cond_str,
+                    "rebate_type": "percent" if is_percent_order else "fixed",
+                    "wm_poi_id": str(promo.get("wm_poi_id") or store_obj.get("wm_poi_id") or "")
+                }, ensure_ascii=False)
+
             db.save_order({
                 "account_key": account_key,
                 "order_sn": order_sn,
@@ -4448,7 +4471,8 @@ async def list_orders(
                 "order_time": int(ot or 0),
                 "order_type": 12 if is_percent_order else order_type_val,
                 "rebate_ratio": rebate_ratio,
-                "delay_count": delay_count_val
+                "delay_count": delay_count_val,
+                "promotion_params": sync_promo_params_json
             })
 
 
@@ -4762,6 +4786,79 @@ async def cancel_order(order_id: int):
     except Exception as e:
         logger.error(f"取消报名请求异常: {e}")
         raise HTTPException(status_code=500, detail=f"取消报名服务异常: {str(e)}")
+
+
+@router.post("/orders/{order_id}/toggle-renew")
+async def toggle_order_renew(order_id: int, data: Dict[str, Any] = Body(default={})):
+    """开启或关闭指定待下单订单的 110 分钟自动无损退单重抢守护"""
+    target_order = db.get_order_by_id(order_id)
+    if not target_order:
+        raise HTTPException(status_code=404, detail="订单记录不存在")
+    if target_order.get("platform_order_id"):
+        raise HTTPException(status_code=400, detail="已在美团下单绑定的订单无法开启自动续期")
+    if target_order.get("status") != "pending":
+        raise HTTPException(status_code=400, detail="仅待下单状态的订单支持自动续期")
+
+    auto_renew = int(data.get("auto_renew", 1) if data.get("auto_renew") is not None else (0 if target_order.get("auto_renew") else 1))
+    from ..core.appointment_worker import calculate_order_renew_schedule, ensure_order_promotion_params, check_account_meal_ticket_count
+
+    if auto_renew:
+        account = db.get_account_by_key(target_order.get("account_key"))
+        if not account or not account.get("token"):
+            raise HTTPException(status_code=400, detail="关联账号不存在或已失效")
+
+        # 核心安全防御：预检账号可用饭票，若为 0 禁止开启自动续期，防止后续自动退单导致名额丢失
+        ticket_count = await check_account_meal_ticket_count(client, account)
+        if ticket_count == 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"账号【{account.get('nickname')}】可用饭票数量为 0。根据小蚕规则，饭票不足无法报名抢单。请先前往小蚕做任务领取饭票后再开启续期守护！"
+            )
+
+        promo_params = await ensure_order_promotion_params(target_order, client, account)
+        order_time = int(target_order.get("order_time") or 0) or int(time.time())
+        end_time = promo_params.get("end_time") or ""
+        sched = calculate_order_renew_schedule(order_time=order_time, activity_end_time_str=end_time)
+        if not sched.get("can_renew"):
+            raise HTTPException(status_code=400, detail=sched.get("reason") or "商户活动已临近截止，无法开启续期")
+
+        db.update_order_renew_meta(order_id, {
+            "auto_renew": 1,
+            "next_renew_ts": sched["next_renew_ts"],
+            "is_final_renew": sched["is_final"],
+            "renew_status": "scheduled",
+            "renew_log": f"[{datetime.now().strftime('%H:%M:%S')}] 用户手动开启自动续期守护: {sched['reason']}"
+        })
+        msg = f"已成功开启自动续期守护，计划将于 {time.strftime('%H:%M:%S', time.localtime(sched['next_renew_ts']))} 执行退单重抢"
+        return {"ok": True, "message": msg, "auto_renew": 1, "next_renew_ts": sched["next_renew_ts"], "is_final": sched["is_final"]}
+    else:
+        db.update_order_renew_meta(order_id, {
+            "auto_renew": 0,
+            "next_renew_ts": 0,
+            "is_final_renew": 0,
+            "renew_status": "idle",
+            "renew_log": f"[{datetime.now().strftime('%H:%M:%S')}] 用户手动关闭自动续期守护"
+        })
+        return {"ok": True, "message": "已关闭自动续期守护", "auto_renew": 0, "next_renew_ts": 0}
+
+
+@router.post("/orders/{order_id}/execute-renew-now")
+async def execute_order_renew_now(order_id: int):
+    """立即手动执行一次极限毫秒级退单并突发重抢续期"""
+    target_order = db.get_order_by_id(order_id)
+    if not target_order:
+        raise HTTPException(status_code=404, detail="订单记录不存在")
+    if target_order.get("platform_order_id"):
+        raise HTTPException(status_code=400, detail="已绑定外卖单号的订单无法退单重抢")
+    if target_order.get("status") != "pending":
+        raise HTTPException(status_code=400, detail="仅待下单状态的订单支持退单重抢续期")
+
+    from ..core.appointment_worker import execute_order_fast_renew
+    res = await execute_order_fast_renew(target_order, action_source="manual_renew")
+    if res.get("ok"):
+        return {"ok": True, "message": res.get("message") or "极速续期成功", "new_order_id": res.get("new_order_id")}
+    else:
+        raise HTTPException(status_code=400, detail=res.get("message") or "极速续期失败")
 
 
 @router.post("/orders/{order_id}/delay-voucher")

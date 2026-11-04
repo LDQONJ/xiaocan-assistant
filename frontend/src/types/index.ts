@@ -283,6 +283,13 @@ export interface Order {
   rebate_ratio?: number;
   delay_count?: number;
   delay_card_used_count?: number;
+  auto_renew?: number;
+  renew_count?: number;
+  next_renew_ts?: number;
+  is_final_renew?: number;
+  renew_status?: 'idle' | 'scheduled' | 'renewing' | 'success' | 'terminated' | 'failed' | string;
+  renew_log?: string;
+  promotion_params?: string;
   created_at: string;
   updated_at?: string;
 }
@@ -323,6 +330,8 @@ export interface StoreAppointment {
   redpack_mode?: number;
   redpack_id?: string;
   redpack_name?: string;
+  end_time?: string;
+  auto_renew_order?: number;
   use_advance_card?: number | boolean;
   keyword?: string;
   match_mode?: 'contains' | 'exact' | string;
@@ -353,6 +362,8 @@ export interface NameMonitorPayload {
   redpack_mode?: number;
   redpack_id?: string;
   redpack_name?: string;
+  end_time?: string;
+  auto_renew_order?: number;
   use_advance_card?: number | boolean;
   store_icon?: string;
 }

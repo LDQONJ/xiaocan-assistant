@@ -228,6 +228,20 @@ def init_db():
         c.execute("ALTER TABLE orders ADD COLUMN delay_count INTEGER DEFAULT 0")
     if "delay_card_used_count" not in cols:
         c.execute("ALTER TABLE orders ADD COLUMN delay_card_used_count INTEGER DEFAULT 0")
+    if "auto_renew" not in cols:
+        c.execute("ALTER TABLE orders ADD COLUMN auto_renew INTEGER DEFAULT 0")
+    if "renew_count" not in cols:
+        c.execute("ALTER TABLE orders ADD COLUMN renew_count INTEGER DEFAULT 0")
+    if "next_renew_ts" not in cols:
+        c.execute("ALTER TABLE orders ADD COLUMN next_renew_ts INTEGER DEFAULT 0")
+    if "is_final_renew" not in cols:
+        c.execute("ALTER TABLE orders ADD COLUMN is_final_renew INTEGER DEFAULT 0")
+    if "renew_status" not in cols:
+        c.execute("ALTER TABLE orders ADD COLUMN renew_status TEXT DEFAULT 'idle'")
+    if "renew_log" not in cols:
+        c.execute("ALTER TABLE orders ADD COLUMN renew_log TEXT DEFAULT ''")
+    if "promotion_params" not in cols:
+        c.execute("ALTER TABLE orders ADD COLUMN promotion_params TEXT DEFAULT ''")
 
     # 自动自愈 orders 中缺失 store_icon 的记录 (从已有历史同名/同 store_id 记录回填)
     try:
@@ -295,6 +309,8 @@ def init_db():
         c.execute("ALTER TABLE store_appointments ADD COLUMN auto_stop_on_success INTEGER DEFAULT 1")
     if "max_order_money" not in apt_cols:
         c.execute("ALTER TABLE store_appointments ADD COLUMN max_order_money REAL DEFAULT 0")
+    if "auto_renew_order" not in apt_cols:
+        c.execute("ALTER TABLE store_appointments ADD COLUMN auto_renew_order INTEGER DEFAULT 1")
 
     # 自动自愈 store_appointments 中缺失 store_icon 的记录 (从 orders 表或同店名同ID回填)
     try:
@@ -932,9 +948,9 @@ def add_appointment(data: Dict[str, Any]) -> int:
             task_type, start_time, until_time, notified_31m, notified_1m,
             check_interval, platform, order_money, rebate_price, rebate_desc, rebate_type, log_id,
             use_advance_card, redpack_id, redpack_name,
-            keyword, match_mode, min_rebate_price, min_rebate_rate, rebate_mode_filter, auto_stop_on_success, max_order_money
+            keyword, match_mode, min_rebate_price, min_rebate_rate, rebate_mode_filter, auto_stop_on_success, max_order_money, auto_renew_order
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             data["account_key"],
             str(data.get("store_id", "")),
@@ -968,7 +984,8 @@ def add_appointment(data: Dict[str, Any]) -> int:
             float(data.get("min_rebate_rate") or 0.0),
             str(data.get("rebate_mode_filter") or "all"),
             int(data.get("auto_stop_on_success") if data.get("auto_stop_on_success") is not None else 1),
-            float(data.get("max_order_money") or 0.0)
+            float(data.get("max_order_money") or 0.0),
+            int(data.get("auto_renew_order") if data.get("auto_renew_order") is not None else 1)
         ))
         conn.commit()
         return cur.lastrowid
@@ -1132,23 +1149,23 @@ def save_order(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if promo_id > 0:
             if acc_key:
                 existing = conn.execute(
-                    "SELECT id, order_sn, platform_order_id, status, delay_count, delay_card_used_count, timeout_time, expire_time FROM orders WHERE promotion_order_id = ? AND account_key = ? ORDER BY (platform_order_id != '') DESC, (status != 'pending') DESC, id DESC LIMIT 1",
+                    "SELECT * FROM orders WHERE promotion_order_id = ? AND account_key = ? ORDER BY (platform_order_id != '') DESC, (status != 'pending') DESC, id DESC LIMIT 1",
                     (promo_id, acc_key)
                 ).fetchone()
             else:
                 existing = conn.execute(
-                    "SELECT id, order_sn, platform_order_id, status, delay_count, delay_card_used_count, timeout_time, expire_time FROM orders WHERE promotion_order_id = ? ORDER BY (platform_order_id != '') DESC, (status != 'pending') DESC, id DESC LIMIT 1",
+                    "SELECT * FROM orders WHERE promotion_order_id = ? ORDER BY (platform_order_id != '') DESC, (status != 'pending') DESC, id DESC LIMIT 1",
                     (promo_id,)
                 ).fetchone()
         if not existing and sn:
             if acc_key:
                 existing = conn.execute(
-                    "SELECT id, order_sn, platform_order_id, status, delay_count, delay_card_used_count, timeout_time, expire_time FROM orders WHERE order_sn = ? AND account_key = ? LIMIT 1",
+                    "SELECT * FROM orders WHERE order_sn = ? AND account_key = ? LIMIT 1",
                     (sn, acc_key)
                 ).fetchone()
             else:
                 existing = conn.execute(
-                    "SELECT id, order_sn, platform_order_id, status, delay_count, delay_card_used_count, timeout_time, expire_time FROM orders WHERE order_sn = ? LIMIT 1",
+                    "SELECT * FROM orders WHERE order_sn = ? LIMIT 1",
                     (sn,)
                 ).fetchone()
 
@@ -1165,6 +1182,19 @@ def save_order(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             chosen_exp = existing.get("expire_time") if (chosen_tt == int(existing.get("timeout_time") or 0) and existing.get("expire_time")) else data.get("expire_time", "")
             if not chosen_plat_id and chosen_tt > 0 and chosen_tt < int(time.time()):
                 new_status = "cancelled"
+
+            chosen_auto_renew = int(data["auto_renew"] if "auto_renew" in data else existing.get("auto_renew", 0))
+            chosen_renew_count = int(data["renew_count"] if "renew_count" in data else existing.get("renew_count", 0))
+            chosen_next_renew_ts = int(data["next_renew_ts"] if "next_renew_ts" in data else existing.get("next_renew_ts", 0))
+            chosen_is_final = int(data["is_final_renew"] if "is_final_renew" in data else existing.get("is_final_renew", 0))
+            chosen_renew_status = str(data["renew_status"] if "renew_status" in data else existing.get("renew_status", "idle"))
+            chosen_renew_log = str(data["renew_log"] if "renew_log" in data else existing.get("renew_log", ""))
+            chosen_promo_params = str(data.get("promotion_params") or existing.get("promotion_params") or "")
+
+            # 若用户在美团端已绑定外卖单号，自动解除续期守护
+            if chosen_plat_id:
+                chosen_auto_renew = 0
+                chosen_renew_status = "terminated"
 
             conn.execute("""
             UPDATE orders SET
@@ -1190,6 +1220,13 @@ def save_order(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 rebate_ratio = :rebate_ratio,
                 delay_count = :delay_count,
                 delay_card_used_count = :delay_card_used_count,
+                auto_renew = :auto_renew,
+                renew_count = :renew_count,
+                next_renew_ts = :next_renew_ts,
+                is_final_renew = :is_final_renew,
+                renew_status = :renew_status,
+                renew_log = :renew_log,
+                promotion_params = :promotion_params,
                 updated_at = :updated_at
             WHERE id = :id
             """, {
@@ -1216,7 +1253,14 @@ def save_order(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "order_type": int(data.get("order_type") or 0),
                 "rebate_ratio": float(data.get("rebate_ratio") or 0),
                 "delay_count": chosen_delay_count,
-                "delay_card_used_count": chosen_delay_card_count
+                "delay_card_used_count": chosen_delay_card_count,
+                "auto_renew": chosen_auto_renew,
+                "renew_count": chosen_renew_count,
+                "next_renew_ts": chosen_next_renew_ts,
+                "is_final_renew": chosen_is_final,
+                "renew_status": chosen_renew_status,
+                "renew_log": chosen_renew_log,
+                "promotion_params": chosen_promo_params
             })
             if promo_id > 0:
                 conn.execute(
@@ -1227,8 +1271,8 @@ def save_order(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             return get_order_by_id(target_id)
 
         cursor = conn.execute("""
-        INSERT INTO orders (account_key, order_sn, promotion_order_id, platform_order_id, store_id, store_name, store_icon, platform, order_money, rebate_money, original_user_rebate, redpack_reward_num, timeout_time, status, condition, receipt_img, reject_reason, expire_time, created_at, updated_at, order_time, order_type, rebate_ratio, delay_count, delay_card_used_count)
-        VALUES (:account_key, :order_sn, :promotion_order_id, :platform_order_id, :store_id, :store_name, :store_icon, :platform, :order_money, :rebate_money, :original_user_rebate, :redpack_reward_num, :timeout_time, :status, :condition, :receipt_img, :reject_reason, :expire_time, :created_at, :updated_at, :order_time, :order_type, :rebate_ratio, :delay_count, :delay_card_used_count)
+        INSERT INTO orders (account_key, order_sn, promotion_order_id, platform_order_id, store_id, store_name, store_icon, platform, order_money, rebate_money, original_user_rebate, redpack_reward_num, timeout_time, status, condition, receipt_img, reject_reason, expire_time, created_at, updated_at, order_time, order_type, rebate_ratio, delay_count, delay_card_used_count, auto_renew, renew_count, next_renew_ts, is_final_renew, renew_status, renew_log, promotion_params)
+        VALUES (:account_key, :order_sn, :promotion_order_id, :platform_order_id, :store_id, :store_name, :store_icon, :platform, :order_money, :rebate_money, :original_user_rebate, :redpack_reward_num, :timeout_time, :status, :condition, :receipt_img, :reject_reason, :expire_time, :created_at, :updated_at, :order_time, :order_type, :rebate_ratio, :delay_count, :delay_card_used_count, :auto_renew, :renew_count, :next_renew_ts, :is_final_renew, :renew_status, :renew_log, :promotion_params)
         ON CONFLICT(order_sn) DO UPDATE SET
             promotion_order_id = excluded.promotion_order_id,
             platform_order_id = excluded.platform_order_id,
@@ -1249,7 +1293,14 @@ def save_order(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             rebate_ratio = excluded.rebate_ratio,
             delay_count = excluded.delay_count,
             created_at = excluded.created_at,
-            updated_at = excluded.updated_at
+            updated_at = excluded.updated_at,
+            auto_renew = CASE WHEN excluded.auto_renew != 0 THEN excluded.auto_renew ELSE orders.auto_renew END,
+            renew_count = CASE WHEN excluded.renew_count != 0 THEN excluded.renew_count ELSE orders.renew_count END,
+            next_renew_ts = CASE WHEN excluded.next_renew_ts != 0 THEN excluded.next_renew_ts ELSE orders.next_renew_ts END,
+            is_final_renew = CASE WHEN excluded.is_final_renew != 0 THEN excluded.is_final_renew ELSE orders.is_final_renew END,
+            renew_status = CASE WHEN excluded.renew_status != 'idle' THEN excluded.renew_status ELSE orders.renew_status END,
+            renew_log = CASE WHEN excluded.renew_log != '' THEN excluded.renew_log ELSE orders.renew_log END,
+            promotion_params = CASE WHEN excluded.promotion_params != '' THEN excluded.promotion_params ELSE orders.promotion_params END
         """, {
             "account_key": data.get("account_key", ""),
             "order_sn": data.get("order_sn", f"XC{int(time.time()*1000)}"),
@@ -1275,7 +1326,14 @@ def save_order(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "order_type": int(data.get("order_type") or 0),
             "rebate_ratio": float(data.get("rebate_ratio") or 0),
             "delay_count": int(data.get("delay_count") or 0),
-            "delay_card_used_count": int(data.get("delay_card_used_count") or 0)
+            "delay_card_used_count": int(data.get("delay_card_used_count") or 0),
+            "auto_renew": int(data.get("auto_renew") or 0),
+            "renew_count": int(data.get("renew_count") or 0),
+            "next_renew_ts": int(data.get("next_renew_ts") or 0),
+            "is_final_renew": int(data.get("is_final_renew") or 0),
+            "renew_status": str(data.get("renew_status") or "idle"),
+            "renew_log": str(data.get("renew_log") or ""),
+            "promotion_params": str(data.get("promotion_params") or "")
         })
         conn.commit()
         last_id = cursor.lastrowid
@@ -1287,7 +1345,9 @@ def update_order(order_id: int, data: Dict[str, Any]) -> Optional[Dict[str, Any]
         "platform_order_id", "status", "receipt_img", "reject_reason",
         "order_money", "rebate_money", "original_user_rebate",
         "redpack_reward_num", "timeout_time", "expire_time", "store_icon",
-        "delay_count", "delay_card_used_count"
+        "delay_count", "delay_card_used_count",
+        "auto_renew", "renew_count", "next_renew_ts", "is_final_renew",
+        "renew_status", "renew_log", "promotion_params"
     ]
     updates = []
     params: Dict[str, Any] = {"id": order_id, "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")}
@@ -1310,6 +1370,59 @@ def delete_order(order_id: int) -> bool:
         conn.execute("DELETE FROM orders WHERE id = ?", (order_id,))
         conn.commit()
     return True
+
+
+def get_order_by_promo_id(promo_id: int, account_key: str = "") -> Optional[Dict[str, Any]]:
+    with get_conn() as conn:
+        if account_key:
+            row = conn.execute(
+                "SELECT * FROM orders WHERE promotion_order_id = ? AND account_key = ? ORDER BY id DESC LIMIT 1",
+                (promo_id, account_key)
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM orders WHERE promotion_order_id = ? ORDER BY id DESC LIMIT 1",
+                (promo_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+
+def get_renewable_orders(now_ts: int = 0) -> List[Dict[str, Any]]:
+    """获取所有已到达或即将到达计划续期时刻、且未在外部绑单的待处理有效订单"""
+    if now_ts <= 0:
+        now_ts = int(time.time())
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT * FROM orders
+            WHERE auto_renew = 1
+              AND status = 'pending'
+              AND (platform_order_id IS NULL OR platform_order_id = '')
+              AND next_renew_ts > 0
+              AND next_renew_ts <= ?
+              AND renew_status IN ('scheduled', 'idle')
+            ORDER BY next_renew_ts ASC
+        """, (now_ts,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_imminent_renew_orders(lookahead_seconds: int = 15) -> List[Dict[str, Any]]:
+    """获取即将进入开火倒计时的订单 (用于提前建立长连接与预编译报文)"""
+    now_ts = int(time.time())
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT * FROM orders
+            WHERE auto_renew = 1
+              AND status = 'pending'
+              AND (platform_order_id IS NULL OR platform_order_id = '')
+              AND next_renew_ts > ?
+              AND next_renew_ts <= ?
+              AND renew_status = 'scheduled'
+        """, (now_ts, now_ts + lookahead_seconds)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def update_order_renew_meta(order_id: int, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    return update_order(order_id, updates)
 
 
 def get_order_stats(account_key: Optional[str] = None) -> Dict[str, Any]:

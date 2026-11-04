@@ -1970,7 +1970,8 @@ class XiaoCanClient:
         vip_promotion_card_id: Optional[Any] = None,
         store_id: Optional[str] = None,
         store_name: Optional[str] = None,
-        wm_poi_id: Optional[str] = None
+        wm_poi_id: Optional[str] = None,
+        **kwargs
     ) -> Dict[str, Any]:
         """
         抢占霸王餐秒杀名额配额 (三模智能路由，严格对齐官方 APK 逆向协议):
@@ -2221,7 +2222,8 @@ class XiaoCanClient:
         city_code: int = 440303,
         store_name: Optional[str] = None,
         latitude: float = 0.0,
-        longitude: float = 0.0
+        longitude: float = 0.0,
+        **kwargs
     ) -> Dict[str, Any]:
         """
         查询店铺霸王餐活动实时库存与详情 (三模智能路由):

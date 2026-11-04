@@ -88,6 +88,18 @@ const calcRemainingSec = (row?: Order, currentNowSec: number = Math.floor(Date.n
   return tt - currentNowSec;
 };
 
+const calcPunishRemainingSec = (row?: Order, currentNowSec: number = Math.floor(Date.now() / 1000)): number | null => {
+  if (!row || !row.order_time) return null;
+  // 小蚕官方 120 分钟 (7200 秒) 扣信用分判定线，以抢单时间为准
+  const punishDeadline = Number(row.order_time) + 7200;
+  return punishDeadline - currentNowSec;
+};
+
+const calcRenewRemainingSec = (row?: Order, currentNowSec: number = Math.floor(Date.now() / 1000)): number | null => {
+  if (!row || !row.next_renew_ts || row.next_renew_ts <= 0) return null;
+  return Number(row.next_renew_ts) - currentNowSec;
+};
+
 export const OrdersView: React.FC = () => {
   const currentAccountKey = useAppStore((s) => s.currentAccountKey);
   const accounts = useAppStore((s) => s.accounts);
@@ -110,6 +122,8 @@ export const OrdersView: React.FC = () => {
   const [submittingDelayCard, setSubmittingDelayCard] = useState(false);
   const [cancellingOrderId, setCancellingOrderId] = useState<number | null>(null);
   const [deletingOrderId, setDeletingOrderId] = useState<number | null>(null);
+  const [renewingOrderId, setRenewingOrderId] = useState<number | null>(null);
+  const [togglingRenewOrderId, setTogglingRenewOrderId] = useState<number | null>(null);
   const [currentNowSec, setCurrentNowSec] = useState<number>(() => Math.floor(Date.now() / 1000));
 
   useEffect(() => {
@@ -327,6 +341,49 @@ export const OrdersView: React.FC = () => {
     }
   };
 
+  const handleToggleAutoRenew = async (order: Order) => {
+    setTogglingRenewOrderId(order.id);
+    try {
+      const willEnable = !(order.auto_renew === 1);
+      const res = await api.toggleOrderAutoRenew(order.id, willEnable);
+      if (res.ok) {
+        Toast.success(res.message || (willEnable ? '已开启自动无损续期守护' : '已关闭自动续期守护'));
+        // 乐观同步界面状态，杜绝等待与闪烁
+        setOrders(prev => prev.map(o => o.id === order.id ? {
+          ...o,
+          auto_renew: willEnable ? 1 : 0,
+          next_renew_ts: res.next_renew_ts !== undefined ? res.next_renew_ts : (willEnable ? o.next_renew_ts : 0),
+          is_final_renew: res.is_final !== undefined ? res.is_final : o.is_final_renew,
+          renew_status: willEnable ? 'scheduled' : 'idle'
+        } : o));
+        fetchOrders(undefined, true, true);
+      } else {
+        Toast.error(res.message || '操作失败');
+      }
+    } catch (e: any) {
+      Toast.error(`切换续期失败: ${e.response?.data?.detail || e.message || e}`);
+    } finally {
+      setTogglingRenewOrderId(null);
+    }
+  };
+
+  const handleExecuteRenewNow = async (order: Order) => {
+    setRenewingOrderId(order.id);
+    try {
+      const res = await api.executeOrderRenewNow(order.id);
+      if (res.ok) {
+        Toast.success(res.message || '极速续期成功，已重置2小时免罚倒计时');
+        fetchOrders(undefined, true);
+      } else {
+        Toast.error(res.message || '极速续期失败');
+      }
+    } catch (e: any) {
+      Toast.error(`极速续期异常: ${e.response?.data?.detail || e.message || e}`);
+    } finally {
+      setRenewingOrderId(null);
+    }
+  };
+
 
   const DEFAULT_PLATFORM_ICONS: Record<string, string> = {
     jingdong: 'https://img10.360buyimg.com/imagetools/jfs/t1/282159/28/8442/32950/67e10a0dFb8e53ae1/3a4d405ef2b69aff.jpg',
@@ -464,7 +521,7 @@ export const OrdersView: React.FC = () => {
     {
       title: '剩余时间',
       dataIndex: 'timeout_time',
-      width: 240,
+      width: 260,
       render: (_: any, row?: Order) => {
         if (!row) return null;
         const status = row.status;
@@ -486,13 +543,15 @@ export const OrdersView: React.FC = () => {
             );
           }
           const isUrgent = remainingSec !== null && remainingSec < 1800;
+          const punishSec = !hasExtId ? calcPunishRemainingSec(row, currentNowSec) : null;
+          const renewSec = (!hasExtId && row.auto_renew === 1) ? calcRenewRemainingSec(row, currentNowSec) : null;
+
           return (
-            <div className="space-y-0.5 py-1">
-              <div className={`text-sm font-semibold font-mono ${isUrgent ? 'text-semi-color-danger' : 'text-semi-color-warning'}`}>
-                {countdownStr}
-              </div>
-              <div className="text-xs text-semi-color-text-2 font-mono flex items-center gap-1 flex-wrap">
-                <span>截止 {row.expire_time ? row.expire_time.slice(5, 16) : '-'}</span>
+            <div className="space-y-1 py-1">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className={`text-sm font-semibold font-mono ${isUrgent ? 'text-semi-color-danger' : 'text-semi-color-warning'}`}>
+                  凭据倒计时: {countdownStr}
+                </span>
                 {hasDelayed && (
                   <Tag color="violet" size="small" shape="square" className="!px-1 !py-0 text-xs">
                     延时2h
@@ -503,6 +562,49 @@ export const OrdersView: React.FC = () => {
                     已用券{cardUsed}张
                   </Tag>
                 )}
+              </div>
+
+              {!hasExtId && (
+                <div className="text-xs font-mono flex items-center gap-1.5 flex-wrap">
+                  {punishSec !== null && (
+                    punishSec > 0 ? (
+                      <span className="text-semi-color-text-2">
+                        免罚退单: 剩 {formatRemainingTime(punishSec)}
+                      </span>
+                    ) : (
+                      <span className="text-semi-color-danger font-semibold">
+                        已超2小时(退单将扣分)
+                      </span>
+                    )
+                  )}
+
+                  {row.auto_renew === 1 ? (
+                    <Tooltip
+                      content={row.renew_log || (row.is_final_renew === 1 ? '活动结束前5分钟末次退单重抢' : '下单后110分钟自动退单重抢以重置2小时限制')}
+                      position="top"
+                    >
+                      <Tag color={row.is_final_renew === 1 ? 'orange' : 'green'} size="small" shape="square" className="!px-1 !py-0 text-xs cursor-pointer">
+                        {row.is_final_renew === 1 ? '末次续期' : '续期守护'}
+                        {renewSec !== null ? (renewSec > 0 ? ` (${formatRemainingTime(renewSec)})` : ' (就绪)') : ''}
+                        {row.renew_count ? ` · 第${row.renew_count}次` : ''}
+                      </Tag>
+                    </Tooltip>
+                  ) : row.renew_status === 'insufficient_ticket' ? (
+                    <Tooltip content={row.renew_log || '账号可用饭票为0，系统已主动拦截退单以保护名额'} position="top">
+                      <Tag color="red" size="small" shape="square" className="!px-1 !py-0 text-xs cursor-pointer">
+                        饭票不足避让
+                      </Tag>
+                    </Tooltip>
+                  ) : (
+                    <Tag color="grey" size="small" shape="square" className="!px-1 !py-0 text-xs">
+                      未开续期守护
+                    </Tag>
+                  )}
+                </div>
+              )}
+
+              <div className="text-xs text-semi-color-text-2 font-mono">
+                <span>截止 {row.expire_time ? row.expire_time.slice(5, 16) : '-'}</span>
               </div>
             </div>
           );
@@ -611,7 +713,7 @@ export const OrdersView: React.FC = () => {
     {
       title: '操作',
       key: 'actions',
-      width: 180,
+      width: 320,
       fixed: 'right',
       render: (_: any, row?: Order) => {
         if (!row) return null;
@@ -628,7 +730,40 @@ export const OrdersView: React.FC = () => {
 
         if (status === 'pending') {
           return (
-            <div className="flex items-center gap-2 flex-wrap">
+            <div className="flex items-center gap-1.5 flex-wrap">
+              {!hasExtId && (
+                <>
+                  <Popconfirm
+                    title="确认执行极速续期？"
+                    content="系统将立即调用官方接口退单并在几十毫秒内突发重抢以重置2小时倒计时（系统将自动校验饭票，若饭票为0将安全拦截以防止名额丢失）。"
+                    okText="确认续期"
+                    cancelText="取消"
+                    onConfirm={() => handleExecuteRenewNow(row)}
+                  >
+                    <Button
+                      theme="light"
+                      type="primary"
+                      size="small"
+                      loading={renewingOrderId === row.id}
+                      title="立即退单并在毫秒内重抢锁定以重置2小时限制"
+                    >
+                      极速续期
+                    </Button>
+                  </Popconfirm>
+
+                  <Button
+                    theme="light"
+                    type={row.auto_renew === 1 ? 'tertiary' : 'secondary'}
+                    size="small"
+                    loading={togglingRenewOrderId === row.id}
+                    onClick={() => handleToggleAutoRenew(row)}
+                    title={row.auto_renew === 1 ? '点击关闭 110 分钟自动续期守护' : '点击开启 110 分钟自动退单重抢守护'}
+                  >
+                    {row.auto_renew === 1 ? '关续期' : '开续期'}
+                  </Button>
+                </>
+              )}
+
               {!isPercentOrder && !hasExtId && (
                 <>
                   {!hasDelayed ? (
@@ -640,7 +775,7 @@ export const OrdersView: React.FC = () => {
                       onClick={() => handleDelayVoucher(row)}
                       title="领红包免费延长有效期 2 小时"
                     >
-                      领红包延时2h
+                      延时2h
                     </Button>
                   ) : (
                     <Button
@@ -650,7 +785,7 @@ export const OrdersView: React.FC = () => {
                       onClick={() => handleOpenDelayCardModal(row)}
                       title="使用卡包内的延时券延长提交时间"
                     >
-                      使用延时券
+                      延时券
                     </Button>
                   )}
                 </>
@@ -670,7 +805,7 @@ export const OrdersView: React.FC = () => {
                     size="small"
                     loading={cancellingOrderId === row.id}
                   >
-                    取消报名
+                    取消
                   </Button>
                 </Popconfirm>
               ) : (
