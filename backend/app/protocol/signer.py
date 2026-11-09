@@ -95,7 +95,7 @@ def generate_headers(
         headers["x-channel"] = "xiaocan"
         headers["X-CityCode"] = str(city_code)
         headers["X-Model"] = "Android Phone"
-        headers["User-Agent"] = "XiaoCan/3.21.1 (Linux; U; Android 14; zh-cn; Mobile) okhttp/4.12.0"
+        headers["User-Agent"] = "okhttp/4.12.0"
 
     if user_id:
         headers["x-Vayne"] = str(user_id)

@@ -297,6 +297,26 @@ async def execute_grab_for_appointment(apt: Dict[str, Any], account: Dict[str, A
         t_step2 = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         log_steps.append(f"[{t_step2}] 步骤 2/4: 红包策略决策 - {rp_desc}")
 
+        # 110% 返利加成券风控与锁定 (默认绝不使用，退单不返还)
+        use_rebate_card = bool(apt.get("use_rebate_card") or False)
+        chosen_rebate_card_id = None
+        if use_rebate_card:
+            specified_rc = apt.get("rebate_card_id")
+            if specified_rc:
+                try:
+                    chosen_rebate_card_id = int(specified_rc)
+                except Exception:
+                    pass
+            if not chosen_rebate_card_id:
+                found_rc = await find_account_rebate_card(client, account)
+                if found_rc:
+                    chosen_rebate_card_id = found_rc["card_id"]
+                    log_steps.append(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] 返利券策略: 智能锁定 110% 返利券 #{chosen_rebate_card_id} ({found_rc.get('name')})")
+                else:
+                    log_steps.append(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] 返利券策略: 卡包未找到可用 110% 返利券，以无券发起")
+        else:
+            log_steps.append(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] 返利券策略: 遵循默认防损策略，不使用 110% 返利券 (防退单作废)")
+
         try:
             t_step3 = datetime.now().strftime("%H:%M:%S.%f")[:-3]
             log_steps.append(f"[{t_step3}] 步骤 3/4: 发起官方抢单 RPC 握手 - promotion_id={promotion_id}, store_platform={platform_code}, advance={advance}")
@@ -312,6 +332,8 @@ async def execute_grab_for_appointment(apt: Dict[str, Any], account: Dict[str, A
                 latitude=lat,
                 longitude=lon,
                 redpack_id=redpack_id,
+                vip_promotion_card_id=chosen_rebate_card_id,
+                vip_extra_silk_card_id=chosen_rebate_card_id,
                 store_id=str(apt.get("store_id") or ""),
                 store_name=str(apt.get("store_name") or ""),
                 wm_poi_id=str(apt.get("wm_poi_id") or "")
@@ -1393,10 +1415,49 @@ async def check_account_meal_ticket_count(
         return -1
 
 
+async def find_account_rebate_card(cli: XiaoCanClient, account: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    智能查询账号卡包中可用的 110% 返利加成券 (status: 0 未使用)
+    小蚕官方规则：此券一旦在报名/抢单时核销，即使立即退单也绝不返还，具有最高级资产保护级别。
+    """
+    token = account.get("token")
+    if not token:
+        return None
+    try:
+        res = await cli.get_user_card_list(
+            token=token,
+            silk_id=account.get("silk_id"),
+            user_id=account.get("user_id"),
+            city_code=int(account.get("city_code") or 440303),
+            status=0,
+            number=100
+        )
+        card_items = res.get("list") or res.get("cards") or []
+        for it in card_items:
+            card = it.get("card") if isinstance(it.get("card"), dict) else {}
+            cname = str(card.get("name") or it.get("name") or card.get("title") or it.get("title") or "").strip()
+            cdesc = str(card.get("desc") or it.get("desc") or "").strip()
+            if "110%" in cname or "110%" in cdesc or "加成" in cname or "加成" in cdesc or "返利" in cname:
+                card_id = it.get("id") or it.get("user_card_id") or it.get("card_id") or card.get("id")
+                if card_id:
+                    return {
+                        "card_id": int(card_id),
+                        "name": cname or "110%返利券",
+                        "expire_time": it.get("expire_time") or card.get("expire_time")
+                    }
+    except Exception as e:
+        logger.warning(f"检查账号可用 110% 返利券异常: {e}")
+    return None
+
+
 async def execute_order_fast_renew(
     order_record: Dict[str, Any],
     caller_client: Optional[XiaoCanClient] = None,
-    action_source: str = "auto_renew"
+    action_source: str = "auto_renew",
+    redpack_mode: Optional[int] = None,
+    specified_redpack_id: Optional[Union[int, str]] = None,
+    use_rebate_card: bool = False,
+    specified_rebate_card_id: Optional[Union[int, str]] = None
 ) -> Dict[str, Any]:
     """
     执行订单极限毫秒级退单与突发重抢续期 (原子执行)
@@ -1558,6 +1619,59 @@ async def execute_order_fast_renew(
         else:
             log_lines.append(f"[{time_service.format_now_ms()}] 步骤 1/4 (安全核验提示): 饭票配额探测轻微网络抖动，按计划推进")
 
+        # 3.3 续期红包风控与预先锁定 (关键：在退单前完成红包探测，确保退单后零延时突发重抢，毫秒锁单)
+        final_rp_mode = redpack_mode
+        if final_rp_mode is None:
+            renew_rp_strategy = db.get_setting("redpack_strategy_renew", "none")
+            final_rp_mode = 0 if renew_rp_strategy == "auto" else 2
+
+        chosen_redpack_id = None
+        chosen_redpack_desc = "遵循防损安全策略，不使用红包 (占座防作废)"
+
+        if final_rp_mode == 0:
+            # 自动匹配最高额度红包 (适合确定就餐)
+            try:
+                max_rp = await cli.get_user_max_redpack(token=token, silk_id=silk_id, user_id=user_id, city_code=city_code)
+                rep_pack = max_rp.get("rep_pack") or {}
+                if not rep_pack and max_rp.get("platform_red_packs"):
+                    rep_pack = max_rp["platform_red_packs"][0]
+                if rep_pack and rep_pack.get("user_red_pack_id"):
+                    chosen_redpack_id = int(rep_pack["user_red_pack_id"])
+                    rp_val = float(rep_pack.get("reward_num", 0) or 0) / 100
+                    chosen_redpack_desc = f"智能锁定最优红包 #{chosen_redpack_id} (金额: ¥{rp_val:.2f})"
+                else:
+                    chosen_redpack_desc = "账号内无可用红包，将以无红包模式重抢"
+            except Exception as rpe:
+                chosen_redpack_desc = f"最优红包查询跳过 ({rpe})，以无红包模式重抢"
+        elif final_rp_mode == 1 and specified_redpack_id:
+            try:
+                chosen_redpack_id = int(specified_redpack_id)
+                chosen_redpack_desc = f"指定使用红包 #{chosen_redpack_id}"
+            except Exception:
+                chosen_redpack_desc = "指定红包编号格式无效，以无红包模式重抢"
+        else:
+            chosen_redpack_desc = "遵循续期防损策略，不使用红包 (继续占座，防作废)"
+
+        log_lines.append(f"[{time_service.format_now_ms()}] 步骤 1/4 (红包预锁定): {chosen_redpack_desc}")
+
+        # 3.4 110% 返利加成券风控与锁定 (小蚕规则：报名使用后退单绝不返还，默认严格不使用)
+        chosen_rebate_card_id = None
+        if use_rebate_card:
+            if specified_rebate_card_id:
+                try:
+                    chosen_rebate_card_id = int(specified_rebate_card_id)
+                except Exception:
+                    pass
+            if not chosen_rebate_card_id:
+                found_rc = await find_account_rebate_card(cli, account)
+                if found_rc:
+                    chosen_rebate_card_id = found_rc["card_id"]
+                    log_lines.append(f"[{time_service.format_now_ms()}] 步骤 1/4 (返利券预锁定): 智能锁定 110% 返利券 #{chosen_rebate_card_id} ({found_rc.get('name')})")
+                else:
+                    log_lines.append(f"[{time_service.format_now_ms()}] 步骤 1/4 (返利券预备): 卡包内未找到可用 110% 返利券，以无券模式重抢")
+        else:
+            log_lines.append(f"[{time_service.format_now_ms()}] 步骤 1/4 (返利券策略): 遵循默认防损策略，不使用 110% 返利券 (防退单作废)")
+
         # 4. 步骤 2: 发起极速退单 (CancelPromotionQuota)
         log_lines.append(f"[{time_service.format_now_ms()}] 步骤 2/4: 发射官方 SilkwormService.CancelPromotionQuota 取消原订单 #{promo_order_id}")
         t_cancel_req = time.time()
@@ -1585,7 +1699,12 @@ async def execute_order_fast_renew(
         # 5. 步骤 3: 零延时突发抢回名额
         log_lines.append(f"[{time_service.format_now_ms()}] 步骤 3/4: 零延时直连开火，发起突发毫秒重抢！")
         platform_code = int(promo_params.get("platform_code") or 1)
-        redpack_id = promo_params.get("redpack_id")
+        redpack_id = chosen_redpack_id
+        if redpack_id:
+            log_lines.append(f"[{time_service.format_now_ms()}] 突发连击携带红包: #{redpack_id}")
+        else:
+            log_lines.append(f"[{time_service.format_now_ms()}] 突发连击红包参数: 零红包重抢锁定名额")
+
         grab_ok = False
         new_promo_order_id = 0
         last_grab_msg = ""
@@ -1605,6 +1724,8 @@ async def execute_order_fast_renew(
                     latitude=lat,
                     longitude=lon,
                     redpack_id=redpack_id,
+                    vip_promotion_card_id=chosen_rebate_card_id,
+                    vip_extra_silk_card_id=chosen_rebate_card_id,
                     store_id=str(promo_params.get("store_id") or ""),
                     store_name=str(fresh_order.get("store_name") or ""),
                     wm_poi_id=str(promo_params.get("wm_poi_id") or "")
@@ -1667,6 +1788,20 @@ async def execute_order_fast_renew(
                 new_next_renew_ts = 0
                 new_is_final = 0
                 final_notice_tail = "单次极速续期成功，已重置 2 小时违约倒计时。当前未开启自动守护，如需后台自动续期可随时开启【开续期】。"
+
+            if redpack_id:
+                promo_params["redpack_id"] = redpack_id
+                promo_params["redpack_mode"] = 0
+                final_notice_tail += f" (已为您自动抵扣红包 #{redpack_id}，请尽快前往美团下单就餐)"
+            else:
+                promo_params["redpack_id"] = None
+                promo_params["redpack_mode"] = 2
+
+            if chosen_rebate_card_id:
+                promo_params["vip_promotion_card_id"] = chosen_rebate_card_id
+                final_notice_tail += f" (已成功抵扣 110% 返利加成券 #{chosen_rebate_card_id}，享超额返现)"
+            else:
+                promo_params.pop("vip_promotion_card_id", None)
 
             new_exp_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_ts + 7200))
             new_order_data = dict(fresh_order)

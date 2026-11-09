@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { Toast } from '@douyinfe/semi-ui';
-import type { Account, AccountDetailData, UserCardItem, TaskItem, FlashSaleShelfResponse, StoreItem, StoreAppointment, NameMonitorPayload, JobLog, UserInfo, Order, DelayCardInfo, OrderStats, DashboardChartData, BatchDailyResult, SystemSettings, NotifyTestResult, LocationSearchResult, ClawBotStatus, ClawBotQrResponse, ClawBotPollResponse, ClawBotActivationResponse, AccountNotifyConfig, AccountNotifyResponse, XiaoCanMessagesResponse, MeituanAccount, MeituanAuthStartResponse, MeituanAuthPollResponse, MeituanPromotionItem } from '../types';
+import type { Account, AccountDetailData, UserCardItem, TaskItem, FlashSaleShelfResponse, StoreItem, StoreAppointment, NameMonitorPayload, JobLog, UserInfo, Order, DelayCardInfo, OrderStats, DashboardChartData, BatchDailyResult, SystemSettings, NotifyTestResult, LocationSearchResult, ClawBotStatus, ClawBotQrResponse, ClawBotPollResponse, ClawBotActivationResponse, AccountNotifyConfig, AccountNotifyResponse, XiaoCanMessagesResponse, MeituanAccount, MeituanAuthStartResponse, MeituanAuthPollResponse, MeituanPromotionItem, RedpackStrategyConfig } from '../types';
 
 export const API_BASE = import.meta.env.VITE_API_BASE || '/api';
 
@@ -181,8 +181,8 @@ export const api = {
     client.post<{ ok: boolean; message: string; raw?: any }>(`/orders/${id}/cancel`).then(r => r.data),
   toggleOrderAutoRenew: (id: number, autoRenew?: boolean) =>
     client.post<{ ok: boolean; message: string; auto_renew: number; next_renew_ts: number; is_final?: number }>(`/orders/${id}/toggle-renew`, { auto_renew: autoRenew ? 1 : 0 }).then(r => r.data),
-  executeOrderRenewNow: (id: number) =>
-    client.post<{ ok: boolean; message: string; new_order_id?: number }>(`/orders/${id}/execute-renew-now`).then(r => r.data),
+  executeOrderRenewNow: (id: number, data?: { redpack_mode?: number; redpack_id?: number | string; use_rebate_card?: boolean; rebate_card_id?: number | string }) =>
+    client.post<{ ok: boolean; message: string; new_order_id?: number }>(`/orders/${id}/execute-renew-now`, data || {}).then(r => r.data),
   deleteOrder: (id: number) => 
     client.delete<{ ok: boolean; message: string }>(`/orders/${id}`).then(r => r.data),
 
@@ -197,6 +197,9 @@ export const api = {
   // 系统配置与通知管理
   getSettings: () => client.get<SystemSettings>('/settings').then(r => r.data),
   saveSettings: (data: Partial<SystemSettings>) => client.post<{ ok: boolean; message: string }>('/settings', data).then(r => r.data),
+  getRedpackStrategy: () => client.get<RedpackStrategyConfig>('/settings/redpack-strategy').then(r => r.data),
+  updateRedpackStrategy: (payload: Partial<RedpackStrategyConfig>) =>
+    client.post<{ ok: boolean; message: string; global_mode: string; renew_mode: string }>('/settings/redpack-strategy', payload).then(r => r.data),
   testNotify: (channel: string, config: Record<string, any>) => 
     client.post<NotifyTestResult>('/settings/test-notify', { channel, config }).then(r => r.data),
   testTianditu: (data: { tianditu_key: string }) =>

@@ -82,7 +82,17 @@ async def root_m_bind(ticket: str = ""):
 # 若前端已打包 (frontend/dist)，则支持前后端合并一键部署
 FRONTEND_DIST = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend", "dist")
 if os.path.exists(FRONTEND_DIST):
-    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
+    class NoCacheStaticFiles(StaticFiles):
+        async def get_response(self, path: str, scope):
+            response = await super().get_response(path, scope)
+            # HTML 入口文件禁止强缓存，确保前端发版更新后浏览器能即时加载最新带哈希的 JS/CSS 资源
+            if path in ("", ".", "index.html") or path.endswith(".html"):
+                response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+                response.headers["Pragma"] = "no-cache"
+                response.headers["Expires"] = "0"
+            return response
+
+    app.mount("/", NoCacheStaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
 
 
 if __name__ == "__main__":

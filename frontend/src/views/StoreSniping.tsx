@@ -304,6 +304,9 @@ export const StoreSniping: React.FC = () => {
     loading: false,
   });
 
+  // 全局抢单红包策略 ('none' | 'auto')，默认 'none' (不使用红包，避免超过1小时退单红包作废)
+  const [redpackStrategyGlobal, setRedpackStrategyGlobal] = useState<'none' | 'auto'>('none');
+
   // 资产明细弹窗状态
   const [assetDetail, setAssetDetail] = useState<AccountDetailData | null>(null);
   const [assetModalVisible, setAssetModalVisible] = useState(false);
@@ -1273,7 +1276,24 @@ export const StoreSniping: React.FC = () => {
   useEffect(() => {
     fetchStores();
     fetchAppointments(false);
+    api.getRedpackStrategy().then(res => {
+      if (res && res.global_mode) {
+        setRedpackStrategyGlobal(res.global_mode === 'auto' ? 'auto' : 'none');
+      }
+    }).catch(() => {});
   }, [fetchStores, fetchAppointments]);
+
+  const handleUpdateRedpackStrategy = useCallback(async (newMode: 'none' | 'auto') => {
+    setRedpackStrategyGlobal(newMode);
+    try {
+      const res = await api.updateRedpackStrategy({ global_mode: newMode });
+      if (res && res.ok) {
+        Toast.success(`抢单红包策略已切换为: ${newMode === 'none' ? '不使用红包 (推荐)' : '自动最优红包'}`);
+      }
+    } catch {
+      Toast.error('更新红包策略失败');
+    }
+  }, []);
 
   // 页面切入激活时自动拉取预约状态与当前账号卡券资产（饭票、超前券、红包）
   useOnActivated('store', () => {
@@ -1409,6 +1429,7 @@ export const StoreSniping: React.FC = () => {
         rebate_type: targetPromo.rebate_type || store.rebate_type,
         end_time: targetPromo.end_time || '',
         auto_renew_order: 1,
+        redpack_mode: redpackStrategyGlobal === 'none' ? 2 : 0,
         advance: advance
       });
 
@@ -1476,6 +1497,7 @@ export const StoreSniping: React.FC = () => {
         redpack_id: chosenRpId,
         redpack_name: chosenRpName,
         use_advance_card: values.use_advance_card ? 1 : 0,
+        use_rebate_card: values.use_rebate_card ? 1 : 0,
         auto_renew_order: 1
       });
 
@@ -1535,6 +1557,7 @@ export const StoreSniping: React.FC = () => {
         redpack_id: chosenRpId,
         redpack_name: chosenRpName,
         use_advance_card: values.use_advance_card ? 1 : 0,
+        use_rebate_card: values.use_rebate_card ? 1 : 0,
         auto_renew_order: 1
       });
 
@@ -2790,7 +2813,43 @@ export const StoreSniping: React.FC = () => {
             </div>
           </Tooltip>
 
-          
+          {/* 全局抢单与续期红包策略切换控件 */}
+          <div className="h-8 flex items-center bg-semi-color-fill-0 border border-semi-color-border rounded-[var(--semi-border-radius-medium)] px-2 hover:border-semi-color-primary transition-all shadow-2xs">
+            <IconGift
+              size="small"
+              className={`mr-1.5 shrink-0 ${redpackStrategyGlobal === 'none' ? 'text-semi-color-text-2' : 'text-rose-500'}`}
+            />
+            <span className="text-xs text-semi-color-text-2 mr-1">红包策略:</span>
+            <Tooltip
+              content={
+                <div className="text-xs space-y-1 py-0.5 max-w-[240px]">
+                  <div className="font-semibold text-semi-color-text-0">抢单红包使用风控策略</div>
+                  <div>• 小蚕规则：订单使用红包超过 1 小时退单将不会返还红包。</div>
+                  <div>• 【不用红包 (推荐)】：立即抢单与续期重抢不消耗红包，确定就餐后再用。</div>
+                  <div>• 【最优红包】：抢单时自动匹配当前账号额度最高的可用红包。</div>
+                </div>
+              }
+              position="bottom"
+            >
+              <span className="inline-flex items-center cursor-pointer mr-1 text-semi-color-text-3 hover:text-semi-color-primary transition-colors">
+                <IconHelpCircle size="small" />
+              </span>
+            </Tooltip>
+            <Select
+              size="small"
+              value={redpackStrategyGlobal}
+              onChange={(val) => handleUpdateRedpackStrategy(val as 'none' | 'auto')}
+              style={{ width: 135 }}
+              className="!border-none !bg-transparent text-xs"
+            >
+              <Select.Option value="none">
+                <span className="text-xs font-medium text-semi-color-text-0">不用红包 (推荐)</span>
+              </Select.Option>
+              <Select.Option value="auto">
+                <span className="text-xs font-medium text-rose-500">自动最优红包</span>
+              </Select.Option>
+            </Select>
+          </div>
 
           {/* 刷新按钮 */}
           <Button
@@ -3703,14 +3762,22 @@ export const StoreSniping: React.FC = () => {
                       <Form.Select
                         field="redpack_mode"
                         label="红包使用策略"
-                        initValue={0}
+                        initValue={redpackStrategyGlobal === 'none' ? 2 : 0}
                         helpText="若指定红包在端外已用将平滑自愈替换"
                         style={{ width: '100%' }}
                       >
                         <Select.Option value={0}>自动匹配最优红包</Select.Option>
                         <Select.Option value={1}>指定具体可用红包</Select.Option>
-                        <Select.Option value={2}>不使用红包</Select.Option>
+                        <Select.Option value={2}>不使用红包 (推荐)</Select.Option>
                       </Form.Select>
+                    </Col>
+                    <Col xs={24}>
+                      <Form.Switch
+                        field="use_rebate_card"
+                        label="使用 110% 返利加成券"
+                        initValue={false}
+                        helpText="小蚕规则：110% 返利券一旦报名即核销，退单绝不返还！默认关闭以防止占座退单造成损失"
+                      />
                     </Col>
                   </Row>
                 </>
@@ -3740,14 +3807,22 @@ export const StoreSniping: React.FC = () => {
                     <Form.Select
                       field="redpack_mode"
                       label="红包使用策略"
-                      initValue={0}
+                      initValue={redpackStrategyGlobal === 'none' ? 2 : 0}
                       helpText="捡漏抢单时使用的红包策略"
                       style={{ width: '100%' }}
                     >
                       <Select.Option value={0}>自动匹配最优红包</Select.Option>
                       <Select.Option value={1}>指定具体可用红包</Select.Option>
-                      <Select.Option value={2}>不使用红包</Select.Option>
+                      <Select.Option value={2}>不使用红包 (推荐)</Select.Option>
                     </Form.Select>
+                  </Col>
+                  <Col xs={24}>
+                    <Form.Switch
+                      field="use_rebate_card"
+                      label="使用 110% 返利加成券"
+                      initValue={false}
+                      helpText="小蚕规则：110% 返利券一旦报名即核销，退单绝不返还！默认关闭以防止占座退单造成损失"
+                    />
                   </Col>
                 </Row>
               )}
@@ -4085,7 +4160,7 @@ export const StoreSniping: React.FC = () => {
             timeout_sec: 7200,
             check_interval: 10,
             auto_stop_on_success: true,
-            redpack_mode: 0,
+            redpack_mode: redpackStrategyGlobal === 'none' ? 2 : 0,
             use_advance_card: assetStats.advanceCouponCount > 0,
           }}
           onSubmit={handleSubmitNameMonitor}

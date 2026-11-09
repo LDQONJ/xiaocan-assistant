@@ -27,7 +27,7 @@ from ..core.jwt_utils import extract_token_from_text, decode_jwt_payload, extrac
 from ..core.proxy_sniffer import sniffer
 from ..core.wechat_scanner import scan_wechat_credentials, wechat_listener
 from ..core.tianditu import tianditu_client
-from ..protocol.client import XiaoCanClient, is_waf_blocked, get_waf_cooldown_seconds, register_shangjin_poi_dict
+from ..protocol.client import XiaoCanClient, XiaoCanRPCError, is_waf_blocked, get_waf_cooldown_seconds, register_shangjin_poi_dict
 
 router = APIRouter(prefix="/api")
 client = XiaoCanClient()
@@ -3752,6 +3752,18 @@ async def grab_store_now(data: Dict[str, Any] = Body(...)):
     if not promotion_id:
         raise HTTPException(status_code=400, detail="缺少 promotion_id 参数")
 
+    # 读取全局抢单红包策略设置 (默认遵循「不使用红包」安全准则，避免超时退单导致红包作废)
+    global_rp_setting = db.get_setting("redpack_strategy_global", "none")
+    default_rp_mode = 2 if global_rp_setting == "none" else 0
+    raw_rp_mode = data.get("redpack_mode")
+    if raw_rp_mode is not None:
+        if isinstance(raw_rp_mode, str):
+            final_rp_mode = 2 if raw_rp_mode == "none" else (0 if raw_rp_mode == "auto" else 1)
+        else:
+            final_rp_mode = int(raw_rp_mode)
+    else:
+        final_rp_mode = default_rp_mode
+
     from ..core.appointment_worker import execute_grab_for_appointment
     apt_data = {
         "id": 0,
@@ -3766,12 +3778,14 @@ async def grab_store_now(data: Dict[str, Any] = Body(...)):
         "rebate_price": float(data.get("rebate_price", 0.0)),
         "rebate_desc": data.get("rebate_desc", ""),
         "rebate_type": str(data.get("rebate_type") or ""),
-        "redpack_mode": int(data.get("redpack_mode", 0)),
-        "redpack_id": data.get("redpack_id"),
-        "redpack_name": data.get("redpack_name", ""),
+        "redpack_mode": final_rp_mode,
+        "redpack_id": data.get("redpack_id") if final_rp_mode != 2 else None,
+        "redpack_name": data.get("redpack_name", "") if final_rp_mode != 2 else "",
         "end_time": str(data.get("end_time") or ""),
         "until_time": str(data.get("until_time") or ""),
-        "auto_renew_order": int(data.get("auto_renew_order") if data.get("auto_renew_order") is not None else 1)
+        "auto_renew_order": int(data.get("auto_renew_order") if data.get("auto_renew_order") is not None else 1),
+        "use_rebate_card": bool(data.get("use_rebate_card", False)),
+        "rebate_card_id": data.get("rebate_card_id")
     }
 
     res = await execute_grab_for_appointment(apt_data, account, advance=bool(data.get("advance", False)), action_source="store_grab")
@@ -4815,6 +4829,11 @@ async def cancel_order(order_id: int):
         return {"ok": True, "message": "霸王餐报名已成功取消，名额已释放", "raw": res}
     except XiaoCanRPCError as e:
         logger.warning(f"取消报名官方接口返回异常: {e}")
+        err_msg = str(e.msg)
+        # 如果官方返回订单无法取消、订单不存在、订单已退单/已失效，自愈同步本地订单状态
+        if e.code == 16 or any(kw in err_msg for kw in ["无法取消", "已取消", "不存在", "已退单", "已失效"]):
+            db.update_order(order_id, {"status": "cancelled"})
+            return {"ok": True, "message": f"小蚕官方返回: {err_msg}，本地订单状态已自动同步为已取消", "raw": e.raw}
         raise HTTPException(status_code=400, detail=f"官方取消失败: {e.msg} (错误码: {e.code})")
     except Exception as e:
         logger.error(f"取消报名请求异常: {e}")
@@ -4882,7 +4901,7 @@ async def toggle_order_renew(order_id: int, data: Dict[str, Any] = Body(default=
 
 
 @router.post("/orders/{order_id}/execute-renew-now")
-async def execute_order_renew_now(order_id: int):
+async def execute_order_renew_now(order_id: int, data: Optional[Dict[str, Any]] = Body(None)):
     """立即手动执行一次极限毫秒级退单并突发重抢续期"""
     target_order = db.get_order_by_id(order_id)
     if not target_order:
@@ -4892,8 +4911,21 @@ async def execute_order_renew_now(order_id: int):
     if target_order.get("status") != "pending":
         raise HTTPException(status_code=400, detail="仅待下单状态的订单支持退单重抢续期")
 
+    req_data = data or {}
+    redpack_mode = req_data.get("redpack_mode")
+    redpack_id = req_data.get("redpack_id")
+    use_rebate_card = bool(req_data.get("use_rebate_card", False))
+    rebate_card_id = req_data.get("rebate_card_id")
+
     from ..core.appointment_worker import execute_order_fast_renew
-    res = await execute_order_fast_renew(target_order, action_source="manual_renew")
+    res = await execute_order_fast_renew(
+        target_order,
+        action_source="manual_renew",
+        redpack_mode=redpack_mode,
+        specified_redpack_id=redpack_id,
+        use_rebate_card=use_rebate_card,
+        specified_rebate_card_id=rebate_card_id
+    )
     if res.get("ok"):
         return {"ok": True, "message": res.get("message") or "极速续期成功", "new_order_id": res.get("new_order_id")}
     else:
@@ -5383,7 +5415,35 @@ async def get_settings():
         "notify_on_coupon_expire": db.get_setting("notify_on_coupon_expire", True),
         "notify_on_task_fail": db.get_setting("notify_on_task_fail", False),
         # 位置服务与天地图 Web API (tianditu.gov.cn)
-        "tianditu_key": db.get_setting("tianditu_key", "109fd484f999e3c0472ab15fa38fe2ac")
+        "tianditu_key": db.get_setting("tianditu_key", "109fd484f999e3c0472ab15fa38fe2ac"),
+        # 外卖红包使用与风控安全策略 (默认 none: 抢单与续期重抢不消耗红包，确定就餐后再用)
+        "redpack_strategy_global": db.get_setting("redpack_strategy_global", "none"),
+        "redpack_strategy_renew": db.get_setting("redpack_strategy_renew", "none")
+    }
+
+
+@router.get("/settings/redpack-strategy")
+async def get_redpack_strategy_endpoint():
+    """获取外卖抢单与续期红包策略设置"""
+    return {
+        "ok": True,
+        "global_mode": db.get_setting("redpack_strategy_global", "none"),
+        "renew_mode": db.get_setting("redpack_strategy_renew", "none"),
+    }
+
+
+@router.post("/settings/redpack-strategy")
+async def update_redpack_strategy_endpoint(data: Dict[str, Any] = Body(...)):
+    """更新外卖抢单与续期红包策略设置"""
+    if "global_mode" in data:
+        db.set_setting("redpack_strategy_global", str(data["global_mode"]))
+    if "renew_mode" in data:
+        db.set_setting("redpack_strategy_renew", str(data["renew_mode"]))
+    return {
+        "ok": True,
+        "message": "红包策略已保存",
+        "global_mode": db.get_setting("redpack_strategy_global", "none"),
+        "renew_mode": db.get_setting("redpack_strategy_renew", "none"),
     }
 
 

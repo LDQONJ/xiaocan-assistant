@@ -355,39 +355,63 @@ class XiaoCanClient:
 
         payload = dict(body) if body else {}
         plat = (platform or "app").lower()
-        if plat == "mini":
-            payload["app_id"] = 20
-        else:
-            payload["app_id"] = 10
-
-        headers = generate_headers(
-            server_name=server_name,
-            method_name=method_name,
-            city_code=city_code,
-            token=token,
-            user_id=user_id,
-            silk_id=silk_id,
-            platform=plat
-        )
 
         # 2. 全局请求速率平滑与并发控制 (防 WAF 瞬时脉冲)
         await _wait_rpc_rate_limit(is_burst=is_burst)
 
-        async def _execute_post() -> Dict[str, Any]:
+        async def _execute_post(target_plat: str) -> Dict[str, Any]:
+            cur_payload = dict(payload)
+            if target_plat == "mini":
+                cur_payload["app_id"] = 20
+            else:
+                cur_payload["app_id"] = 10
+
+            cur_headers = generate_headers(
+                server_name=server_name,
+                method_name=method_name,
+                city_code=city_code,
+                token=token,
+                user_id=user_id,
+                silk_id=silk_id,
+                platform=target_plat
+            )
+
             try:
                 resp = await self.session.post(
                     GW_BASE_URL,
-                    json=payload,
-                    headers=headers
+                    json=cur_payload,
+                    headers=cur_headers
                 )
-                if resp.status_code == 403:
-                    is_waf = "WAF" in resp.text or "stgw" in resp.headers.get("server", "").lower()
-                    if is_waf:
-                        mark_waf_blocked()
+                resp_text = resp.text or ""
+                resp_headers_lower = {k.lower(): str(v).lower() for k, v in resp.headers.items()}
+                server_hdr = resp_headers_lower.get("server", "")
+                set_cookie_hdr = resp_headers_lower.get("set-cookie", "")
+
+                is_captcha = (
+                    "tcaptcha" in resp_text.lower() or
+                    "tencentcaptcha" in resp_text.lower() or
+                    "x-waf-captcha" in set_cookie_hdr
+                )
+                is_waf_block = (
+                    resp.status_code == 403 or
+                    "waf拦截" in resp_text or
+                    ("stgw" in server_hdr and "<html" in resp_text.lower())
+                )
+
+                # 若使用 app 协议触发了腾讯云 WAF 拦截或滑块验证，尝试自动降级切换至微信小程序原生协议重试
+                if (is_captcha or is_waf_block) and target_plat != "mini":
+                    logger.info(f"RPC {server_name}.{method_name} App 协议触发 WAF 频控/验证码拦截，自动切换至微信小程序协议重试...")
+                    return await _execute_post("mini")
+
+                if is_captcha or is_waf_block:
+                    mark_waf_blocked()
                     remain_sec = get_waf_cooldown_seconds()
-                    hint = f"已被腾讯云 WAF 防火墙拦截 [403 Forbidden]，系统已进入 {remain_sec} 秒自适应频次缓冲保护。请勿高频连续点击重试，可切换手机热点或等待冷却" if is_waf else "请求被服务器拒绝 [403 Forbidden]"
+                    if is_captcha:
+                        hint = f"官方触发腾讯云 WAF 腾讯验证码验证（滑块验证），系统已开启 {remain_sec} 秒频次保护。请稍后重试，或在手机微信小蚕小程序中手动完成验证/切换手机网络热点重试"
+                    else:
+                        hint = f"已被腾讯云 WAF 防火墙拦截 [状态码: {resp.status_code}]，系统已进入 {remain_sec} 秒自适应频次缓冲保护。请勿高频连续点击重试，可切换手机网络热点或等待冷却"
                     logger.error(f"RPC {server_name}.{method_name} 访问受阻: {hint}")
-                    raise XiaoCanRPCError(code=403, msg=hint, raw={"status_code": 403, "text": resp.text[:200]})
+                    raise XiaoCanRPCError(code=403, msg=hint, raw={"status_code": resp.status_code, "text": resp_text[:200], "captcha": is_captcha})
 
                 if resp.status_code != 200:
                     err_text = ""
@@ -395,30 +419,46 @@ class XiaoCanClient:
                         err_json = resp.json()
                         err_text = (err_json.get("status") or {}).get("msg") or err_json.get("detail") or err_json.get("msg") or err_json.get("error") or ""
                     except Exception:
-                        err_text = resp.text.strip()
+                        err_text = resp_text.strip()
 
                     if resp.status_code == 401:
                         hint = err_text or "登录凭据已过期或鉴权失效 (HTTP 401 Unauthorized)，请在「账号管理」中重新获取并更新 Token 凭据"
                         logger.warning(f"RPC {server_name}.{method_name} 鉴权失效: {hint}")
-                        raise XiaoCanRPCError(code=401, msg=hint, raw={"status_code": 401, "text": resp.text[:200]})
+                        raise XiaoCanRPCError(code=401, msg=hint, raw={"status_code": 401, "text": resp_text[:200]})
 
                     msg = err_text or f"HTTP {resp.status_code} 异常"
-                    logger.error(f"RPC {server_name}.{method_name} HTTP {resp.status_code} 异常响应: {resp.text[:200]}")
-                    raise XiaoCanRPCError(code=resp.status_code, msg=msg, raw={"status_code": resp.status_code, "text": resp.text[:200]})
+                    logger.error(f"RPC {server_name}.{method_name} HTTP {resp.status_code} 异常响应: {resp_text[:200]}")
+                    raise XiaoCanRPCError(code=resp.status_code, msg=msg, raw={"status_code": resp.status_code, "text": resp_text[:200]})
 
-                return resp.json()
+                try:
+                    return resp.json()
+                except Exception as je:
+                    raw_preview = resp_text.strip()[:200]
+                    if ("<html" in resp_text.lower() or "<script" in resp_text.lower()) and target_plat != "mini":
+                        logger.info(f"RPC {server_name}.{method_name} 收到 HTML 响应，自动切换至微信小程序协议重试...")
+                        return await _execute_post("mini")
+
+                    if "<html" in resp_text.lower() or "<script" in resp_text.lower() or "stgw" in server_hdr:
+                        mark_waf_blocked()
+                        remain_sec = get_waf_cooldown_seconds()
+                        hint = f"官方网关返回 HTML 页面而非 JSON（可能触发安全风控或验证码拦截），系统已开启 {remain_sec} 秒频次保护。请切换手机热点或稍后再试"
+                        logger.error(f"RPC {server_name}.{method_name} 官方返回非 JSON: {hint}, 预览: {raw_preview}")
+                        raise XiaoCanRPCError(code=403, msg=hint, raw={"status_code": resp.status_code, "text": raw_preview})
+
+                    logger.error(f"RPC {server_name}.{method_name} JSON 解析失败: {je}, 响应体: {raw_preview}")
+                    raise XiaoCanRPCError(code=resp.status_code or 500, msg=f"官方返回非标准响应内容: {raw_preview or '空'}", raw={"status_code": resp.status_code, "text": raw_preview})
             except XiaoCanRPCError:
                 raise
             except Exception as e:
                 logger.error(f"RPC {server_name}.{method_name} network failure: {e}")
-                raise
+                raise XiaoCanRPCError(code=500, msg=f"网络请求通信异常: {str(e)}")
 
         # 秒杀爆发请求 (is_burst=True) 绝对零等待直射开火，不经任何流控与并发信号量，保障多账号准时并发毫秒级命中
         if is_burst:
-            data = await _execute_post()
+            data = await _execute_post(plat)
         else:
             async with _RPC_SEMAPHORE:
-                data = await _execute_post()
+                data = await _execute_post(plat)
 
         # 3. 请求成功，重置 WAF 连续阻断计数
         record_waf_success()

@@ -263,6 +263,7 @@ export interface Order {
   id: number;
   account_key: string;
   order_sn: string;
+  promotion_order_id?: number | string;
   platform_order_id?: string;
   store_id?: string;
   store_name: string;
@@ -330,6 +331,7 @@ export interface StoreAppointment {
   condition?: string;
   rebate_type?: string;
   rebate_card_id?: string;
+  use_rebate_card?: number | boolean;
   redpack_mode?: number;
   redpack_id?: string;
   redpack_name?: string;
@@ -368,6 +370,7 @@ export interface NameMonitorPayload {
   end_time?: string;
   auto_renew_order?: number;
   use_advance_card?: number | boolean;
+  use_rebate_card?: number | boolean;
   store_icon?: string;
 }
 
@@ -672,6 +675,16 @@ export interface SystemSettings {
   notify_on_task_fail: boolean;
   // 位置服务与天地图 Web API (tianditu.gov.cn)
   tianditu_key?: string;
+  // 外卖红包使用与风控安全策略
+  redpack_strategy_global?: 'none' | 'auto' | string;
+  redpack_strategy_renew?: 'none' | 'inherit' | string;
+}
+
+export interface RedpackStrategyConfig {
+  ok?: boolean;
+  global_mode: 'none' | 'auto' | string;
+  renew_mode: 'none' | 'inherit' | string;
+  message?: string;
 }
 
 export interface NotifyTestResult {

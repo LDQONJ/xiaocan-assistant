@@ -18,7 +18,8 @@ import {
   Spin,
   Banner,
   InputNumber,
-  Tooltip
+  Tooltip,
+  Switch
 } from '@douyinfe/semi-ui';
 import { gsap, useGSAP } from '../utils/animations';
 
@@ -27,7 +28,10 @@ import {
   IconRefresh,
   IconCopy,
   IconSearch,
-  IconDelete
+  IconDelete,
+  IconGift,
+  IconShield,
+  IconTicketCode
 } from '@douyinfe/semi-icons';
 import { useAppStore } from '../store/useAppStore';
 import { api } from '../api';
@@ -125,6 +129,12 @@ export const OrdersView: React.FC = () => {
   const [renewingOrderId, setRenewingOrderId] = useState<number | null>(null);
   const [togglingRenewOrderId, setTogglingRenewOrderId] = useState<number | null>(null);
   const [currentNowSec, setCurrentNowSec] = useState<number>(() => Math.floor(Date.now() / 1000));
+
+  // 极速续期选择弹窗状态
+  const [renewModalVisible, setRenewModalVisible] = useState(false);
+  const [selectedRenewOrder, setSelectedRenewOrder] = useState<Order | null>(null);
+  const [renewRedpackMode, setRenewRedpackMode] = useState<number>(2); // 2: 不用红包(占座), 0: 使用最优红包(就餐)
+  const [useRebateCard, setUseRebateCard] = useState<boolean>(false); // 是否使用110%返利券(默认不使用，防退单损耗)
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -367,12 +377,25 @@ export const OrdersView: React.FC = () => {
     }
   };
 
-  const handleExecuteRenewNow = async (order: Order) => {
+  const handleOpenRenewModal = (order: Order) => {
+    setSelectedRenewOrder(order);
+    setRenewRedpackMode(2); // 默认不使用红包，保障占座安全
+    setUseRebateCard(false); // 默认不使用110%返利券，防止退单作废
+    setRenewModalVisible(true);
+  };
+
+  const handleConfirmRenew = async () => {
+    if (!selectedRenewOrder) return;
+    const order = selectedRenewOrder;
     setRenewingOrderId(order.id);
     try {
-      const res = await api.executeOrderRenewNow(order.id);
+      const res = await api.executeOrderRenewNow(order.id, {
+        redpack_mode: renewRedpackMode,
+        use_rebate_card: useRebateCard
+      });
       if (res.ok) {
         Toast.success(res.message || '极速续期成功，已重置2小时免罚倒计时');
+        setRenewModalVisible(false);
         fetchOrders(undefined, true);
       } else {
         Toast.error(res.message || '极速续期失败');
@@ -742,25 +765,17 @@ export const OrdersView: React.FC = () => {
             <div className="flex items-center gap-1.5 flex-wrap">
               {!hasExtId && (
                 <>
-                  <Popconfirm
-                    title="确认执行极速续期？"
-                    content="系统将立即调用官方接口退单并在几十毫秒内突发重抢以重置2小时倒计时（系统将自动校验饭票，若饭票为0将安全拦截以防止名额丢失）。"
-                    okText="确认续期"
-                    cancelText="取消"
+                  <Button
+                    theme="light"
+                    type="primary"
+                    size="small"
                     disabled={Boolean(row.is_activity_expired)}
-                    onConfirm={() => handleExecuteRenewNow(row)}
+                    loading={renewingOrderId === row.id}
+                    onClick={() => handleOpenRenewModal(row)}
+                    title={row.is_activity_expired ? '商户活动报名已截止，无法执行退单重抢' : '极速退单并突发重抢以重置2小时限制，支持自由选择是否使用红包'}
                   >
-                    <Button
-                      theme="light"
-                      type="primary"
-                      size="small"
-                      disabled={Boolean(row.is_activity_expired)}
-                      loading={renewingOrderId === row.id}
-                      title={row.is_activity_expired ? '商户活动报名已截止，无法执行退单重抢' : '立即退单并在毫秒内重抢锁定以重置2小时限制'}
-                    >
-                      极速续期
-                    </Button>
-                  </Popconfirm>
+                    极速续期
+                  </Button>
 
                   <Button
                     theme="light"
@@ -1154,6 +1169,156 @@ export const OrdersView: React.FC = () => {
                 }
               />
             )}
+          </div>
+        )}
+      </Modal>
+
+      {/* 极速续期与就餐红包策略选择弹窗 */}
+      <Modal
+        title={
+          <div className="flex items-center gap-2">
+            <IconRefresh className="text-semi-color-primary" />
+            <span>极速续期与就餐红包选择</span>
+          </div>
+        }
+        visible={renewModalVisible}
+        onCancel={() => {
+          if (!renewingOrderId) setRenewModalVisible(false);
+        }}
+        footer={
+          <div className="flex items-center justify-between w-full">
+            <span className="text-xs text-semi-color-text-2">
+              {renewRedpackMode === 0 ? '将自动锁定最高面额红包下单' : '零红包重抢，防退单红包作废'}
+              {useRebateCard ? ' · 已开启110%返利券' : ''}
+            </span>
+            <div className="flex items-center gap-2">
+              <Button
+                disabled={Boolean(renewingOrderId)}
+                onClick={() => setRenewModalVisible(false)}
+              >
+                取消
+              </Button>
+              <Button
+                theme="solid"
+                type="primary"
+                loading={Boolean(renewingOrderId)}
+                onClick={handleConfirmRenew}
+              >
+                立即确认续期
+              </Button>
+            </div>
+          </div>
+        }
+        width={520}
+        centered
+      >
+        {selectedRenewOrder && (
+          <div className="space-y-4 py-1">
+            <div className="p-3 bg-semi-color-fill-0 border border-semi-color-border rounded-lg space-y-1">
+              <div className="flex items-center justify-between">
+                <Text strong className="text-sm text-semi-color-text-0">
+                  {selectedRenewOrder.store_name}
+                </Text>
+                <Tag color="cyan" size="small">
+                  原单号 #{selectedRenewOrder.promotion_order_id || selectedRenewOrder.order_sn}
+                </Tag>
+              </div>
+              <div className="text-xs text-semi-color-text-2 flex items-center gap-3">
+                <span>实付: ¥{selectedRenewOrder.order_money}</span>
+                <span>返现: ¥{selectedRenewOrder.rebate_money}</span>
+                <span>状态: 待下单中</span>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <Text strong className="text-xs text-semi-color-text-1 uppercase tracking-wider">
+                  本次续期重抢红包策略
+                </Text>
+                <Tag color={renewRedpackMode === 0 ? 'red' : 'blue'} size="small">
+                  {renewRedpackMode === 0 ? '就餐抵扣模式' : '安全占座模式'}
+                </Tag>
+              </div>
+
+              <RadioGroup
+                direction="vertical"
+                value={renewRedpackMode}
+                onChange={(e) => setRenewRedpackMode(Number(e.target.value))}
+                className="w-full space-y-2"
+              >
+                <Radio
+                  value={2}
+                  className={`w-full !p-3 !m-0 rounded-lg border transition-all ${
+                    renewRedpackMode === 2
+                      ? 'border-semi-color-primary bg-semi-color-primary-light-default'
+                      : 'border-semi-color-border hover:bg-semi-color-fill-0'
+                  }`}
+                >
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-1.5">
+                      <IconShield size="small" className="text-semi-color-primary" />
+                      <span className="font-semibold text-sm text-semi-color-text-0">
+                        不使用红包 (推荐 · 继续占座)
+                      </span>
+                      <Tag color="green" size="small">防作废安全</Tag>
+                    </div>
+                    <div className="text-xs text-semi-color-text-2 leading-relaxed">
+                      适合人未到店、仅刷新 2 小时就餐倒计时的场景。零红包重抢，彻底防止因超过 1 小时退单造成红包永久作废。
+                    </div>
+                  </div>
+                </Radio>
+
+                <Radio
+                  value={0}
+                  className={`w-full !p-3 !m-0 rounded-lg border transition-all ${
+                    renewRedpackMode === 0
+                      ? 'border-red-500 bg-red-50/60 dark:bg-red-950/20'
+                      : 'border-semi-color-border hover:bg-semi-color-fill-0'
+                  }`}
+                >
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-1.5">
+                      <IconGift size="small" className="text-red-500" />
+                      <span className="font-semibold text-sm text-semi-color-text-0">
+                        使用最优红包 (确定就餐 · 享受立减)
+                      </span>
+                      <Tag color="red" size="small">即抢即吃</Tag>
+                    </div>
+                    <div className="text-xs text-semi-color-text-2 leading-relaxed">
+                      适合马上前往美团/饿了么下单就餐的场景。系统在退单前自动匹配锁定当前账号内额度最高的外卖红包，并在毫秒突发重抢时带上该红包下单锁定，抢到后请尽快在端内就餐消费。
+                    </div>
+                  </div>
+                </Radio>
+              </RadioGroup>
+            </div>
+
+            {/* 110% 返利加成券配置卡片 */}
+            <div className={`p-3 rounded-lg border transition-all ${useRebateCard ? 'border-amber-500 bg-amber-50/60 dark:bg-amber-950/20' : 'border-semi-color-border bg-semi-color-fill-0'}`}>
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <IconTicketCode className={useRebateCard ? 'text-amber-500' : 'text-semi-color-text-2'} />
+                  <span className="font-semibold text-sm text-semi-color-text-0">使用 110% 返利券 (加成卡)</span>
+                  <Tag color={useRebateCard ? 'amber' : 'grey'} size="small">
+                    {useRebateCard ? '确定就餐使用' : '默认不使用'}
+                  </Tag>
+                </div>
+                <Switch
+                  checked={useRebateCard}
+                  onChange={(checked) => setUseRebateCard(checked)}
+                />
+              </div>
+              <div className="text-xs text-semi-color-text-2 mt-1.5 leading-relaxed">
+                {useRebateCard
+                  ? '已开启：系统将在退单前自动匹配锁定卡包中的 110% 返利券，毫秒重抢带上并享受超额返现。注意：小蚕规则此券一旦使用立即退单也绝不返还，请确保立即在美团/饿了么下单就餐！'
+                  : '默认关闭：不使用 110% 返利券。避免因临时变动退单导致珍贵返利神券永久作废。'}
+              </div>
+            </div>
+
+            <Banner
+              type="info"
+              closeIcon={null}
+              description="退单重抢前系统将自动进行饭票充足性与商户活动状态安全双检。若饭票为 0 或活动已终结，将自动拦截避让以保全当前订单名额。"
+            />
           </div>
         )}
       </Modal>

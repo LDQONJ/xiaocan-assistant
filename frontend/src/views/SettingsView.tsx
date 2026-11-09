@@ -1678,6 +1678,101 @@ export const SettingsView: React.FC = () => {
                   </div>
                 </TabPane>
 
+                {/* Tab: 外卖红包与风控策略 */}
+                <TabPane
+                  tab={
+                    <span className="flex items-center gap-2 font-medium px-2 py-1">
+                      <IconGift className="text-semi-color-primary" />
+                      外卖红包与风控
+                    </span>
+                  }
+                  itemKey="redpack"
+                >
+                  <div className="settings-tab-panel tab-panel-redpack pt-4 space-y-6">
+                    <Card
+                      className="rounded-xl border border-semi-color-border shadow-xs"
+                      title={
+                        <div>
+                          <span className="font-semibold text-base">抢单与续期外卖红包策略</span>
+                          <Text type="secondary" size="small" className="block mt-0.5">
+                            精准控制霸王餐立即抢单、名额监听与订单续期时的红包抵扣逻辑，防范官方超过 1 小时退单作废风险
+                          </Text>
+                        </div>
+                      }
+                      headerExtraContent={
+                        <Tag color="cyan" size="small">
+                          资产安全保护
+                        </Tag>
+                      }
+                    >
+                      <div className="space-y-6">
+                        <Banner
+                          type="warning"
+                          closeIcon={null}
+                          title="重要风控规则提示 (小蚕官方退单返还机制)"
+                          description={
+                            <div className="space-y-1 text-xs text-semi-color-text-1">
+                              <div>1. 官方规定：若订单使用了外卖满返红包，下单后 1 小时内主动取消退单，红包将原路退回账号。</div>
+                              <div>2. 核心风险：若下单时间超过 1 小时后再退单，原红包将被平台永久判定为已作废，不会返还。</div>
+                              <div>3. 系统防护：极速续期与自动续期守护通常在抢单 110 分钟后触发退单重抢，若原订单使用了红包，退单后该红包必定损失。因此系统默认在续期时「不使用红包」，仅在确认真实就餐时再手动使用红包。</div>
+                            </div>
+                          }
+                        />
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pt-2">
+                          <div className="p-4 rounded-lg bg-semi-color-fill-0 border border-semi-color-border space-y-3">
+                            <div className="flex items-center gap-2">
+                              <IconGift className="text-semi-color-primary" />
+                              <Text strong className="text-sm text-semi-color-text-0">立即抢单全局默认策略</Text>
+                            </div>
+                            <Text type="secondary" size="small" className="block">
+                              商户列表页「立即抢单」或新建预约监听时的初始红包选项。
+                            </Text>
+                            <Form.Select
+                              field="redpack_strategy_global"
+                              label="抢单红包模式"
+                              initValue="none"
+                              style={{ width: '100%' }}
+                            >
+                              <Form.Select.Option value="none">不使用红包 (推荐，防意外锁券作废)</Form.Select.Option>
+                              <Form.Select.Option value="auto">自动使用最优红包 (适合即抢即吃)</Form.Select.Option>
+                            </Form.Select>
+                            <div className="text-xs text-semi-color-text-2">
+                              {values?.redpack_strategy_global === 'auto'
+                                ? '当前模式：立即抢单时将自动为您抵扣可用额度最高的外卖红包。'
+                                : '当前模式：抢单与占座时不抵扣红包，避免因未就餐退单导致红包作废，建议确认吃时再用。'}
+                            </div>
+                          </div>
+
+                          <div className="p-4 rounded-lg bg-semi-color-fill-0 border border-semi-color-border space-y-3">
+                            <div className="flex items-center gap-2">
+                              <IconShield className="text-semi-color-primary" />
+                              <Text strong className="text-sm text-semi-color-text-0">订单续期重抢红包策略</Text>
+                            </div>
+                            <Text type="secondary" size="small" className="block">
+                              手动「极速续期」或后台「自动续期守护」退单后重新抢单时的红包行为。
+                            </Text>
+                            <Form.Select
+                              field="redpack_strategy_renew"
+                              label="续期重抢红包模式"
+                              initValue="none"
+                              style={{ width: '100%' }}
+                            >
+                              <Form.Select.Option value="none">不使用红包 (强烈推荐，守护资产)</Form.Select.Option>
+                              <Form.Select.Option value="auto">继续自动使用最优红包 (注意：将消耗新红包)</Form.Select.Option>
+                            </Form.Select>
+                            <div className="text-xs text-semi-color-text-2">
+                              {values?.redpack_strategy_renew === 'auto'
+                                ? '风险提示：超过1小时退单原红包已无法返还，重新抢单将再次扣除您账号中的其他可用红包。'
+                                : '安全模式：续期重抢只占座不消耗任何红包，彻底杜绝连续自动续期烧毁宝贵红包。'}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </Card>
+                  </div>
+                </TabPane>
+
                 {/* Tab 3: 位置与地理服务 */}
                 <TabPane
                   tab={
