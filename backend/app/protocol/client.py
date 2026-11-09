@@ -10,6 +10,7 @@ import os
 import random
 import re
 import tempfile
+import sys
 import time
 import uuid
 from typing import Any, Dict, Optional
@@ -18,10 +19,13 @@ import httpx
 try:
     # 软依赖 (issue #14): curl_cffi 提供 TLS 指纹伪装 (自定义 JA3); 未安装时回退 httpx
     from curl_cffi import requests as _curl_requests
+    from curl_cffi.const import CurlOpt as _CurlOpt
 except ImportError:
     _curl_requests = None
+    _CurlOpt = None
 
 from .signer import generate_headers
+from ..core import time_service
 
 logger = logging.getLogger("xiaocan.protocol")
 
@@ -157,6 +161,24 @@ class _CurlCffiTransport:
         if ca_bundle:
             kwargs["verify"] = ca_bundle
         kwargs.update(fingerprint_kwargs)
+
+        # DNS 解析增强 (解决 issue #17: Windows c-ares resolver 解析失败导致 curl (6) NODATA)
+        # 支持通过环境变量 XIAOCAN_DNS_SERVERS 自定义公共 DNS，若设置为 off 则不指定
+        if _CurlOpt is not None:
+            dns_env = (os.getenv("XIAOCAN_DNS_SERVERS") or "").strip()
+            dns_servers = None
+            if dns_env and dns_env.lower() != "off":
+                dns_servers = dns_env
+            elif dns_env.lower() != "off":
+                import sys
+                if sys.platform == "win32":
+                    dns_servers = "223.5.5.5,119.29.29.29"
+
+            if dns_servers:
+                curl_opts = kwargs.get("curl_options") or {}
+                curl_opts[_CurlOpt.DNS_SERVERS] = dns_servers
+                kwargs["curl_options"] = curl_opts
+
         self.session = _curl_requests.AsyncSession(**kwargs)
 
     async def post(self, url: str, json: Any = None, headers: Optional[Dict[str, str]] = None):
@@ -270,20 +292,20 @@ async def _wait_rpc_rate_limit(is_burst: bool = False):
     if is_burst:
         return
     async with _RPC_RATE_LOCK:
-        now = time.time()
+        now = time_service.now_ts()
         elapsed = now - _last_rpc_timestamp
         min_interval = random.uniform(0.22, 0.38)
         if elapsed < min_interval:
             await asyncio.sleep(min_interval - elapsed)
-        _last_rpc_timestamp = time.time()
+        _last_rpc_timestamp = time_service.now_ts()
 
 
 def is_waf_blocked() -> bool:
-    return time.time() < _waf_blocked_until
+    return time_service.now_ts() < _waf_blocked_until
 
 
 def get_waf_cooldown_seconds() -> int:
-    return max(0, int(_waf_blocked_until - time.time()))
+    return max(0, int(_waf_blocked_until - time_service.now_ts()))
 
 
 def mark_waf_blocked(duration_seconds: Optional[int] = None):
@@ -298,7 +320,7 @@ def mark_waf_blocked(duration_seconds: Optional[int] = None):
         cooldown = 15 if _waf_consecutive_blocks == 1 else (30 if _waf_consecutive_blocks == 2 else 60)
     else:
         cooldown = min(duration_seconds, 60)
-    _waf_blocked_until = max(_waf_blocked_until, time.time() + cooldown)
+    _waf_blocked_until = max(_waf_blocked_until, time_service.now_ts() + cooldown)
 
 
 def record_waf_success():
@@ -390,11 +412,13 @@ class XiaoCanClient:
                 is_captcha = (
                     "tcaptcha" in resp_text.lower() or
                     "tencentcaptcha" in resp_text.lower() or
+                    "__captcha" in resp_text or
                     "x-waf-captcha" in set_cookie_hdr
                 )
                 is_waf_block = (
                     resp.status_code == 403 or
                     "waf拦截" in resp_text or
+                    "WAF" in resp_text or
                     ("stgw" in server_hdr and "<html" in resp_text.lower())
                 )
 
@@ -445,8 +469,12 @@ class XiaoCanClient:
                         logger.error(f"RPC {server_name}.{method_name} 官方返回非 JSON: {hint}, 预览: {raw_preview}")
                         raise XiaoCanRPCError(code=403, msg=hint, raw={"status_code": resp.status_code, "text": raw_preview})
 
-                    logger.error(f"RPC {server_name}.{method_name} JSON 解析失败: {je}, 响应体: {raw_preview}")
-                    raise XiaoCanRPCError(code=resp.status_code or 500, msg=f"官方返回非标准响应内容: {raw_preview or '空'}", raw={"status_code": resp.status_code, "text": raw_preview})
+                    logger.error(f"RPC {server_name}.{method_name} 响应解析非 JSON 异常: {raw_preview}")
+                    raise XiaoCanRPCError(
+                        code=502,
+                        msg=f"网关响应格式异常: {str(je)[:100]}",
+                        raw={"status_code": resp.status_code, "text": raw_preview}
+                    )
             except XiaoCanRPCError:
                 raise
             except Exception as e:
@@ -1354,7 +1382,7 @@ class XiaoCanClient:
         import random
 
         nonce = "".join(random.choice(string.ascii_lowercase) for _ in range(6))
-        ts = int(time.time())
+        ts = time_service.now_int()
         sid = int(silk_id) if silk_id else 0
         raw_str = f"silk_id={sid}&timestamp={ts}&nonce={nonce}&bus_type={bus_type}"
         key = b"lcjkbqadfrzsewxy"
