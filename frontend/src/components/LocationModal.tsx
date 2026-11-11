@@ -284,6 +284,19 @@ export const LocationModal: React.FC<LocationModalProps> = ({ visible, onClose }
 
     setActiveLocation(newLoc);
     addLocationHistory(newLoc);
+
+    // 立即同步至后端账号库，确保后台常驻监听与嗅探引擎实时生效
+    try {
+      await api.syncLocation({
+        city_code: newLoc.cityCode,
+        city_name: newLoc.cityName,
+        longitude: newLoc.longitude,
+        latitude: newLoc.latitude
+      });
+    } catch (e) {
+      console.warn('同步抢单定位至后端失败:', e);
+    }
+
     Toast.success(`抢单位置已更新：${newLoc.cityName} · ${newLoc.addressName}`);
     onClose();
   };

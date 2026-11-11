@@ -1499,7 +1499,11 @@ export const StoreSniping: React.FC = () => {
         redpack_name: chosenRpName,
         use_advance_card: values.use_advance_card ? 1 : 0,
         use_rebate_card: values.use_rebate_card ? 1 : 0,
-        auto_renew_order: 1
+        auto_renew_order: 1,
+        city_code: activeLocation?.cityCode,
+        city_name: activeLocation?.cityName,
+        longitude: activeLocation?.longitude !== undefined ? String(activeLocation.longitude) : undefined,
+        latitude: activeLocation?.latitude !== undefined ? String(activeLocation.latitude) : undefined
       });
 
       Toast.success(isMonitor ? `已开启【${cleanEmoji(selectedStore.name)}】名额监听任务` : `店铺【${cleanEmoji(selectedStore.name)}】已加入定时预约抢单队列`);
@@ -1559,7 +1563,11 @@ export const StoreSniping: React.FC = () => {
         redpack_name: chosenRpName,
         use_advance_card: values.use_advance_card ? 1 : 0,
         use_rebate_card: values.use_rebate_card ? 1 : 0,
-        auto_renew_order: 1
+        auto_renew_order: 1,
+        city_code: activeLocation?.cityCode,
+        city_name: activeLocation?.cityName,
+        longitude: activeLocation?.longitude !== undefined ? String(activeLocation.longitude) : undefined,
+        latitude: activeLocation?.latitude !== undefined ? String(activeLocation.latitude) : undefined
       });
 
       if (res.ok) {

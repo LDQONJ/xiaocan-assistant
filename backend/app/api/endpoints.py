@@ -217,6 +217,39 @@ async def update_account_profile_endpoint(key: str, data: Dict[str, Any] = Body(
     return {"ok": True, "account": updated, "message": "账号资料已更新"}
 
 
+@router.post("/accounts/sync-location")
+async def sync_accounts_location(data: Dict[str, Any] = Body(...)):
+    """将全局抢单定位同步更新至全部账号 (或指定账号)"""
+    city_code = int(data.get("city_code") or 0)
+    city_name = str(data.get("city_name") or "").strip()
+    lon = str(data.get("longitude") or "").strip()
+    lat = str(data.get("latitude") or "").strip()
+    account_key = data.get("account_key")
+
+    if not lon or not lat:
+        raise HTTPException(status_code=400, detail="缺少有效的经纬度坐标")
+
+    update_payload: Dict[str, Any] = {
+        "longitude": lon,
+        "latitude": lat,
+    }
+    if city_code > 0:
+        update_payload["city_code"] = city_code
+    if city_name:
+        update_payload["city_name"] = city_name
+
+    if account_key:
+        db.update_account_profile(account_key, update_payload)
+    else:
+        for acc in db.get_all_accounts():
+            db.update_account_profile(acc["key"], update_payload)
+
+    from ..core.appointment_worker import invalidate_worker_cache
+    invalidate_worker_cache()
+
+    return {"ok": True, "message": f"账号抢单定位已同步更新为: {city_name or '高精定位点'} ({lon}, {lat})"}
+
+
 @router.get("/accounts/{key}/notify-config")
 async def get_account_notify_config_endpoint(key: str):
     """获取指定账号的通知模式与独立通道配置"""
@@ -4126,6 +4159,19 @@ async def create_name_monitor(data: Dict[str, Any] = Body(...)):
     except Exception:
         pass
 
+    city_code = int(data.get("city_code") or 0)
+    city_name = str(data.get("city_name") or "").strip()
+    lon = str(data.get("longitude") or "").strip()
+    lat = str(data.get("latitude") or "").strip()
+
+    if lon and lat:
+        update_profile: Dict[str, Any] = {"longitude": lon, "latitude": lat}
+        if city_code > 0:
+            update_profile["city_code"] = city_code
+        if city_name:
+            update_profile["city_name"] = city_name
+        db.update_account_profile(account_key, update_profile)
+
     apt_data = {
         "account_key": account_key,
         "store_id": "0",
@@ -4149,7 +4195,11 @@ async def create_name_monitor(data: Dict[str, Any] = Body(...)):
         "redpack_id": str(data.get("redpack_id") or ""),
         "redpack_name": str(data.get("redpack_name") or ""),
         "rebate_desc": f"店名监听【{keyword}】({plat_desc})",
-        "log_id": log_id
+        "log_id": log_id,
+        "city_code": city_code or int(account.get("city_code") if account else 440300),
+        "city_name": city_name or (account.get("city_name") if account else "深圳"),
+        "longitude": lon or (account.get("longitude") if account else "113.87719"),
+        "latitude": lat or (account.get("latitude") if account else "22.55137")
     }
     aid = db.add_appointment(apt_data)
     if log_id > 0:
@@ -4740,7 +4790,12 @@ async def submit_platform_order_id(order_id: int, data: Dict[str, Any] = Body(..
     updated = db.update_order(order_id, {
         "platform_order_id": platform_order_id,
         "status": new_status,
-        "receipt_img": data.get("receipt_img", "")
+        "receipt_img": data.get("receipt_img", ""),
+        "auto_renew": 0,
+        "next_renew_ts": 0,
+        "is_final_renew": 0,
+        "renew_status": "terminated",
+        "renew_log": f"[{time_service.format_now_ms()}] 用户已回填外卖单号 ({platform_order_id})，续期守护已安全终结"
     })
     msg = "外卖单号与评价凭证已提交审核！预计 2-24 小时内核销到账" if has_receipt else "外卖单号已成功绑定！待外卖送达后即可在小蚕APP提交评价反馈"
     

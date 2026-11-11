@@ -674,9 +674,9 @@ async def process_active_appointments() -> Tuple[bool, bool]:
             token = account.get("token")
             silk_id = account.get("silk_id")
             user_id = account.get("user_id")
-            city_code = int(account.get("city_code") or 440300)
-            lon = str(account.get("longitude") or "114.13166")
-            lat = str(account.get("latitude") or "22.548361")
+            city_code = int(apt.get("city_code") or account.get("city_code") or 440300)
+            lon = str(apt.get("longitude") or account.get("longitude") or "113.87719")
+            lat = str(apt.get("latitude") or account.get("latitude") or "22.55137")
 
             try:
                 from ..api.endpoints import _extract_all_promos_from_raw, _normalize_shangjin_item
@@ -1487,6 +1487,8 @@ async def execute_order_fast_renew(
         if fresh_order.get("platform_order_id"):
             db.update_order_renew_meta(order_id, {
                 "auto_renew": 0,
+                "next_renew_ts": 0,
+                "is_final_renew": 0,
                 "renew_status": "terminated",
                 "renew_log": f"[{time_service.format_now_ms()}] 美团端已绑定外卖单号 ({fresh_order.get('platform_order_id')})，续期守护已安全终结"
             })
@@ -1495,6 +1497,8 @@ async def execute_order_fast_renew(
         if fresh_order.get("status") != "pending":
             db.update_order_renew_meta(order_id, {
                 "auto_renew": 0,
+                "next_renew_ts": 0,
+                "is_final_renew": 0,
                 "renew_status": "terminated",
                 "renew_log": f"[{time_service.format_now_ms()}] 订单状态非待下单 ({fresh_order.get('status')})，续期守护已终结"
             })
@@ -1515,6 +1519,93 @@ async def execute_order_fast_renew(
         city_code = int(account.get("city_code") or 440303)
         lat = str(account.get("latitude") or "22.548361")
         lon = str(account.get("longitude") or "114.13166")
+
+        # 严格前置安全校验 A2: 直连小蚕官方权威核验该订单实时状态与绑单情况 (严防用户已在美团下单/小程序已上传单号)
+        log_lines.append(f"[{time_service.format_now_ms()}] 严格前置核验: 向小蚕官方服务端核验订单实时状态与绑单情况 (小蚕单号 #{promo_order_id})")
+        try:
+            official_check_res = await cli.get_order_list(
+                token=token,
+                silk_id=silk_id,
+                user_id=user_id,
+                order_status=99,
+                offset=0,
+                number=30,
+                city_code=city_code
+            )
+            raw_orders = official_check_res.get("order_list") or official_check_res.get("orders") or []
+            matched_official = None
+            for ro in raw_orders:
+                r_poid = int(ro.get("promotion_order_id") or 0)
+                r_sn = str(ro.get("order_id_str") or ro.get("promotion_order_id") or "")
+                if (promo_order_id > 0 and r_poid == promo_order_id) or (fresh_order.get("order_sn") and r_sn == str(fresh_order.get("order_sn"))):
+                    matched_official = ro
+                    break
+
+            if matched_official:
+                official_plat_id = str(
+                    matched_official.get("platform_order_id")
+                    or matched_official.get("source_order_id")
+                    or matched_official.get("store_platform_order_id")
+                    or matched_official.get("platform_order_sn")
+                    or matched_official.get("third_order_id")
+                    or ""
+                ).strip()
+                if official_plat_id.lower() == "none":
+                    official_plat_id = ""
+
+                official_st = int(matched_official.get("order_status", 0) or 0)
+                cancel_time = int(matched_official.get("cancel_time") or 0)
+
+                # 情况 1: 官方核验到外卖订单号已绑定/已上传 (无论是美团授权自动关联还是用户手动填单)
+                if official_plat_id:
+                    st_str = "auditing" if official_st == 1 else ("completed" if official_st == 2 else "pending")
+                    db.update_order(order_id, {
+                        "platform_order_id": official_plat_id,
+                        "auto_renew": 0,
+                        "next_renew_ts": 0,
+                        "is_final_renew": 0,
+                        "renew_status": "terminated",
+                        "status": st_str,
+                        "renew_log": f"[{time_service.format_now_ms()}] 官方权威核验：已绑定外卖单号 ({official_plat_id})，用户已就餐下单，自动终结续期守护，严禁退单"
+                    })
+                    try:
+                        await send_system_notification(
+                            title="霸王餐续期安全避让",
+                            content=f"账号【{account.get('nickname')}】店铺【{fresh_order.get('store_name')}】已在平台绑定外卖单号 ({official_plat_id})，续期守护已安全终结，请安心享用美食！",
+                            account_key=account_key,
+                            event=NotificationEvent.APPOINT_EVENT,
+                            level=NotificationLevel.INFO
+                        )
+                    except Exception as ne:
+                        logger.warning(f"发送续期避让通知异常: {ne}")
+                    return {"ok": False, "message": f"订单已绑定外卖单号 ({official_plat_id})，续期守护已安全终结"}
+
+                # 情况 2: 官方订单状态非待下单 (例如已在审核中、已完成、已取消、超时关闭)
+                if cancel_time > 0 or official_st in (1, 2, 3, 4, 5):
+                    st_map = {1: "auditing", 2: "completed", 3: "rejected", 4: "cancelled", 5: "cancelled"}
+                    new_local_st = st_map.get(official_st, "cancelled")
+                    db.update_order(order_id, {
+                        "auto_renew": 0,
+                        "next_renew_ts": 0,
+                        "is_final_renew": 0,
+                        "renew_status": "terminated",
+                        "status": new_local_st,
+                        "renew_log": f"[{time_service.format_now_ms()}] 官方权威核验：订单官方状态已为 {official_st} ({new_local_st})，无需续期，守护终结"
+                    })
+                    return {"ok": False, "message": f"订单官方状态为 {new_local_st}，无需续期"}
+            else:
+                # 官方列表中找不到该待处理订单，且返回了列表
+                if raw_orders:
+                    db.update_order(order_id, {
+                        "auto_renew": 0,
+                        "next_renew_ts": 0,
+                        "renew_status": "terminated",
+                        "status": "cancelled",
+                        "renew_log": f"[{time_service.format_now_ms()}] 官方权威核验：小蚕官方列表中未找到订单 #{promo_order_id}，订单已失效或已取消，终止续期"
+                    })
+                    return {"ok": False, "message": f"小蚕官方未找到订单 #{promo_order_id}，终止续期"}
+        except Exception as oe:
+            logger.warning(f"官方核验订单实时状态异常: {oe}")
 
         # 2. 前置安全校验 B: 解析原始抢单参数 (若缺失则启动在线双重自愈补全)
         promo_params = await ensure_order_promotion_params(fresh_order, cli, account)
@@ -1881,6 +1972,157 @@ async def execute_order_fast_renew(
         _renewing_order_ids.discard(order_id)
 
 
+_last_orders_sync_ts = 0
+
+
+async def sync_active_renewable_orders():
+    """
+    后台主动常驻巡检：
+    对当前所有开启了续期守护 (auto_renew=1) 的待处理订单，周期性 (约 15 秒) 与小蚕官方同步实时状态。
+    一旦感知到：
+    1. 官方已回传外卖单号 (platform_order_id)；
+    2. 或者官方 timeout_time 已自动顺延至次日；
+    3. 或者官方订单状态已脱离待下单 (auditing/completed)；
+    立即主动解除续期守护 (auto_renew=0, renew_status='terminated', next_renew_ts=0)，
+    并更新截止时间至次日，使用户无需担惊受怕，前端界面即时感知守护解除。
+    """
+    global _last_orders_sync_ts
+    now_ts = int(time.time())
+    if now_ts - _last_orders_sync_ts < 15:
+        return
+
+    _last_orders_sync_ts = now_ts
+
+    try:
+        renewable_orders = db.get_orders(status="pending")
+    except Exception:
+        renewable_orders = []
+
+    active_targets = [o for o in renewable_orders if o.get("auto_renew") == 1]
+    if not active_targets:
+        return
+
+    accounts_map: Dict[str, List[Dict[str, Any]]] = {}
+    for ord_row in active_targets:
+        acc_k = ord_row.get("account_key")
+        if acc_k:
+            accounts_map.setdefault(acc_k, []).append(ord_row)
+
+    for acc_key, ord_list in accounts_map.items():
+        acc = db.get_account_by_key(acc_key)
+        if not acc or not acc.get("token"):
+            continue
+
+        try:
+            token = acc["token"]
+            silk_id = acc.get("silk_id")
+            user_id = acc.get("user_id")
+            city_code = int(acc.get("city_code") or 440300)
+
+            rpc_res = await client.get_order_list(
+                token=token,
+                silk_id=silk_id,
+                user_id=user_id,
+                order_status=99,
+                offset=0,
+                number=20,
+                city_code=city_code
+            )
+            raw_orders = rpc_res.get("order_list") or rpc_res.get("orders") or []
+            if not raw_orders:
+                continue
+
+            for local_ord in ord_list:
+                local_oid = local_ord.get("id")
+                target_poid = int(local_ord.get("promotion_order_id") or 0)
+                target_sn = str(local_ord.get("order_sn") or "")
+
+                matched_raw = None
+                for ro in raw_orders:
+                    r_poid = int(ro.get("promotion_order_id") or 0)
+                    r_sn = str(ro.get("order_id_str") or ro.get("promotion_order_id") or "")
+                    if (target_poid > 0 and r_poid == target_poid) or (target_sn and r_sn == target_sn):
+                        matched_raw = ro
+                        break
+
+                if not matched_raw:
+                    continue
+
+                official_plat_id = str(
+                    matched_raw.get("platform_order_id")
+                    or matched_raw.get("source_order_id")
+                    or matched_raw.get("store_platform_order_id")
+                    or matched_raw.get("platform_order_sn")
+                    or matched_raw.get("third_order_id")
+                    or ""
+                ).strip()
+                if official_plat_id.lower() == "none":
+                    official_plat_id = ""
+
+                official_st = int(matched_raw.get("order_status", 0) or 0)
+                official_tt = int(matched_raw.get("timeout_time") or 0)
+
+                should_terminate = False
+                terminate_reason = ""
+
+                # 条件 A: 官方已回传外卖订单号
+                if official_plat_id:
+                    should_terminate = True
+                    terminate_reason = f"检测到外卖单号已绑定 ({official_plat_id})"
+
+                # 条件 B: 官方订单状态脱离待下单
+                elif official_st in (1, 2, 3, 4, 5):
+                    should_terminate = True
+                    st_desc = {1: "审核中", 2: "已完成", 3: "已驳回", 4: "已取消", 5: "已关闭"}.get(official_st, "已流转")
+                    terminate_reason = f"官方订单状态已流转为【{st_desc}】"
+
+                # 条件 C: 官方 timeout_time 已经延期至次日或超过正常 2 小时窗口
+                elif official_tt > 0:
+                    local_created_ts = local_ord.get("order_time") or 0
+                    if not local_created_ts and local_ord.get("created_at"):
+                        try:
+                            local_created_ts = int(time.mktime(time.strptime(local_ord["created_at"], "%Y-%m-%d %H:%M:%S")))
+                        except Exception:
+                            pass
+                    # 若官方截止时间距离下单时间超过 3 小时，说明官方已给该单大幅延期 (就餐后顺延至次日)
+                    if local_created_ts > 0 and (official_tt - local_created_ts > 10800):
+                        should_terminate = True
+                        exp_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(official_tt))
+                        terminate_reason = f"官方核销截止时间已顺延至次日 ({exp_time_str})"
+
+                if should_terminate:
+                    st_str = "auditing" if official_st == 1 else ("completed" if official_st == 2 else local_ord.get("status", "pending"))
+                    up_data: Dict[str, Any] = {
+                        "auto_renew": 0,
+                        "next_renew_ts": 0,
+                        "is_final_renew": 0,
+                        "renew_status": "terminated",
+                        "status": st_str,
+                        "renew_log": f"[{time_service.format_now_ms()}] 巡检自动感知：{terminate_reason}，续期守护已自动终结"
+                    }
+                    if official_plat_id:
+                        up_data["platform_order_id"] = official_plat_id
+                    if official_tt > 0:
+                        up_data["timeout_time"] = official_tt
+                        up_data["expire_time"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(official_tt))
+
+                    db.update_order(local_oid, up_data)
+                    logger.info(f"[订单守护主动终结] 订单 #{local_oid} ({local_ord.get('store_name')}): {terminate_reason}，已自动解除续期守护")
+
+                    try:
+                        await send_system_notification(
+                            title="霸王餐续期守护自动解除",
+                            content=f"账号【{acc.get('nickname')}】店铺【{local_ord.get('store_name')}】：{terminate_reason}，系统已自动解除续期守护，请安心享用美食！",
+                            account_key=acc_key,
+                            event=NotificationEvent.APPOINT_EVENT,
+                            level=NotificationLevel.INFO
+                        )
+                    except Exception as ne:
+                        logger.warning(f"发送解除通知异常: {ne}")
+        except Exception as e:
+            logger.warning(f"后台主动同步续期订单异常 ({acc_key}): {e}")
+
+
 async def process_active_order_renews() -> bool:
     """
     后台常驻巡检订单自动续期任务：
@@ -1918,6 +2160,13 @@ async def _appointment_loop():
         except Exception as re:
             logger.error(f"订单自动续期巡检发生未捕获异常: {re}")
             has_renew_primed = False
+
+        try:
+            await sync_active_renewable_orders()
+        except asyncio.CancelledError:
+            break
+        except Exception as se:
+            logger.error(f"订单守护主动巡检发生未捕获异常: {se}")
 
         if has_primed:
             await asyncio.sleep(0.02)

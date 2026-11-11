@@ -312,6 +312,14 @@ def init_db():
         c.execute("ALTER TABLE store_appointments ADD COLUMN max_order_money REAL DEFAULT 0")
     if "auto_renew_order" not in apt_cols:
         c.execute("ALTER TABLE store_appointments ADD COLUMN auto_renew_order INTEGER DEFAULT 1")
+    if "city_code" not in apt_cols:
+        c.execute("ALTER TABLE store_appointments ADD COLUMN city_code INTEGER DEFAULT 0")
+    if "city_name" not in apt_cols:
+        c.execute("ALTER TABLE store_appointments ADD COLUMN city_name TEXT DEFAULT ''")
+    if "longitude" not in apt_cols:
+        c.execute("ALTER TABLE store_appointments ADD COLUMN longitude TEXT DEFAULT ''")
+    if "latitude" not in apt_cols:
+        c.execute("ALTER TABLE store_appointments ADD COLUMN latitude TEXT DEFAULT ''")
 
     # 自动自愈 store_appointments 中缺失 store_icon 的记录 (从 orders 表或同店名同ID回填)
     try:
@@ -990,9 +998,10 @@ def add_appointment(data: Dict[str, Any]) -> int:
             task_type, start_time, until_time, notified_31m, notified_1m,
             check_interval, platform, order_money, rebate_price, rebate_desc, rebate_type, log_id,
             use_advance_card, redpack_id, redpack_name,
-            keyword, match_mode, min_rebate_price, min_rebate_rate, rebate_mode_filter, auto_stop_on_success, max_order_money, auto_renew_order
+            keyword, match_mode, min_rebate_price, min_rebate_rate, rebate_mode_filter, auto_stop_on_success, max_order_money, auto_renew_order,
+            city_code, city_name, longitude, latitude
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             data["account_key"],
             str(data.get("store_id", "")),
@@ -1027,7 +1036,11 @@ def add_appointment(data: Dict[str, Any]) -> int:
             str(data.get("rebate_mode_filter") or "all"),
             int(data.get("auto_stop_on_success") if data.get("auto_stop_on_success") is not None else 1),
             float(data.get("max_order_money") or 0.0),
-            int(data.get("auto_renew_order") if data.get("auto_renew_order") is not None else 1)
+            int(data.get("auto_renew_order") if data.get("auto_renew_order") is not None else 1),
+            int(data.get("city_code") or 0),
+            str(data.get("city_name") or ""),
+            str(data.get("longitude") or ""),
+            str(data.get("latitude") or "")
         ))
         conn.commit()
         return cur.lastrowid
@@ -1234,8 +1247,10 @@ def save_order(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             chosen_promo_params = str(data.get("promotion_params") or existing.get("promotion_params") or "")
 
             # 若用户在美团端已绑定外卖单号，自动解除续期守护
-            if chosen_plat_id:
+            if chosen_plat_id or new_status != "pending":
                 chosen_auto_renew = 0
+                chosen_next_renew_ts = 0
+                chosen_is_final = 0
                 chosen_renew_status = "terminated"
 
             conn.execute("""
@@ -1336,11 +1351,27 @@ def save_order(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             delay_count = excluded.delay_count,
             created_at = excluded.created_at,
             updated_at = excluded.updated_at,
-            auto_renew = CASE WHEN excluded.auto_renew != 0 THEN excluded.auto_renew ELSE orders.auto_renew END,
+            auto_renew = CASE 
+                WHEN (excluded.platform_order_id IS NOT NULL AND excluded.platform_order_id != '') OR excluded.status != 'pending' THEN 0
+                WHEN excluded.auto_renew != 0 THEN excluded.auto_renew 
+                ELSE orders.auto_renew 
+            END,
             renew_count = CASE WHEN excluded.renew_count != 0 THEN excluded.renew_count ELSE orders.renew_count END,
-            next_renew_ts = CASE WHEN excluded.next_renew_ts != 0 THEN excluded.next_renew_ts ELSE orders.next_renew_ts END,
-            is_final_renew = CASE WHEN excluded.is_final_renew != 0 THEN excluded.is_final_renew ELSE orders.is_final_renew END,
-            renew_status = CASE WHEN excluded.renew_status != 'idle' THEN excluded.renew_status ELSE orders.renew_status END,
+            next_renew_ts = CASE 
+                WHEN (excluded.platform_order_id IS NOT NULL AND excluded.platform_order_id != '') OR excluded.status != 'pending' THEN 0
+                WHEN excluded.next_renew_ts != 0 THEN excluded.next_renew_ts 
+                ELSE orders.next_renew_ts 
+            END,
+            is_final_renew = CASE 
+                WHEN (excluded.platform_order_id IS NOT NULL AND excluded.platform_order_id != '') OR excluded.status != 'pending' THEN 0
+                WHEN excluded.is_final_renew != 0 THEN excluded.is_final_renew 
+                ELSE orders.is_final_renew 
+            END,
+            renew_status = CASE 
+                WHEN (excluded.platform_order_id IS NOT NULL AND excluded.platform_order_id != '') OR excluded.status != 'pending' THEN 'terminated'
+                WHEN excluded.renew_status != 'idle' THEN excluded.renew_status 
+                ELSE orders.renew_status 
+            END,
             renew_log = CASE WHEN excluded.renew_log != '' THEN excluded.renew_log ELSE orders.renew_log END,
             promotion_params = CASE WHEN excluded.promotion_params != '' THEN excluded.promotion_params ELSE orders.promotion_params END
         """, {
@@ -1383,6 +1414,15 @@ def save_order(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def update_order(order_id: int, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    # 若更新中包含非空 platform_order_id 或状态变更为非 pending，自动将续期守护彻底解除
+    plat_id = str(data.get("platform_order_id") or "").strip()
+    status_val = str(data.get("status") or "").strip()
+    if (plat_id and plat_id.lower() != "none") or (status_val and status_val != "pending"):
+        data.setdefault("auto_renew", 0)
+        data.setdefault("next_renew_ts", 0)
+        data.setdefault("is_final_renew", 0)
+        data.setdefault("renew_status", "terminated")
+
     allowed = [
         "platform_order_id", "status", "receipt_img", "reject_reason",
         "order_money", "rebate_money", "original_user_rebate",

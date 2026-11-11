@@ -347,6 +347,10 @@ export interface StoreAppointment {
   max_order_money?: number;
   log_id?: number;
   outcome?: string;
+  city_code?: number;
+  city_name?: string;
+  longitude?: string;
+  latitude?: string;
   created_at: string;
 }
 
@@ -372,6 +376,10 @@ export interface NameMonitorPayload {
   use_advance_card?: number | boolean;
   use_rebate_card?: number | boolean;
   store_icon?: string;
+  city_code?: number;
+  city_name?: string;
+  longitude?: string;
+  latitude?: string;
 }
 
 export interface JobLog {

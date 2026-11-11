@@ -163,6 +163,14 @@ export const useAppStore = create<AppState>((set, get) => {
       localStorage.setItem('xiaocan_active_location', JSON.stringify(updated));
     } catch (e) {}
     set({ activeLocation: updated });
+    if (updated.longitude && updated.latitude) {
+      api.syncLocation({
+        city_code: updated.cityCode,
+        city_name: updated.cityName,
+        longitude: updated.longitude,
+        latitude: updated.latitude
+      }).catch(() => {});
+    }
   },
 
   addLocationHistory: (loc: ActiveLocation) => {
@@ -234,6 +242,15 @@ export const useAppStore = create<AppState>((set, get) => {
           }
         }
         set({ accounts, currentAccountKey: newCurrent, loading: false });
+        const loc = get().activeLocation;
+        if (loc && loc.longitude && loc.latitude) {
+          api.syncLocation({
+            city_code: loc.cityCode,
+            city_name: loc.cityName,
+            longitude: loc.longitude,
+            latitude: loc.latitude
+          }).catch(() => {});
+        }
       } catch (e) {
         set({ loading: false });
       } finally {

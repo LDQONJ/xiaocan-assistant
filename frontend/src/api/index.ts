@@ -228,4 +228,7 @@ export const api = {
       }>('/time')
       .then(r => r.data),
 
+  // 同步全局抢单位置到后端账号库
+  syncLocation: (data: { city_code?: number; city_name?: string; longitude: string; latitude: string; account_key?: string }) =>
+    client.post<{ ok: boolean; message: string }>('/accounts/sync-location', data).then(r => r.data),
 };
