@@ -1981,10 +1981,9 @@ async def sync_active_renewable_orders():
     对当前所有开启了续期守护 (auto_renew=1) 的待处理订单，周期性 (约 15 秒) 与小蚕官方同步实时状态。
     一旦感知到：
     1. 官方已回传外卖单号 (platform_order_id)；
-    2. 或者官方 timeout_time 已自动顺延至次日；
-    3. 或者官方订单状态已脱离待下单 (auditing/completed)；
+    2. 或者官方订单状态已脱离待下单 (auditing/completed/cancelled)；
     立即主动解除续期守护 (auto_renew=0, renew_status='terminated', next_renew_ts=0)，
-    并更新截止时间至次日，使用户无需担惊受怕，前端界面即时感知守护解除。
+    严格禁止仅凭 timeout_time 误解除守护，确保未绑单时 2 小时违约倒计时全程守护。
     """
     global _last_orders_sync_ts
     now_ts = int(time.time())
@@ -2065,30 +2064,16 @@ async def sync_active_renewable_orders():
                 should_terminate = False
                 terminate_reason = ""
 
-                # 条件 A: 官方已回传外卖订单号
+                # 条件 A: 官方已回传外卖订单号 (用户已在美团下单/微信端手动绑单/美团授权自动关联)
                 if official_plat_id:
                     should_terminate = True
                     terminate_reason = f"检测到外卖单号已绑定 ({official_plat_id})"
 
-                # 条件 B: 官方订单状态脱离待下单
+                # 条件 B: 官方订单状态脱离待下单 (例如已提交凭据进入审核中 1、已完成 2、已取消 4)
                 elif official_st in (1, 2, 3, 4, 5):
                     should_terminate = True
                     st_desc = {1: "审核中", 2: "已完成", 3: "已驳回", 4: "已取消", 5: "已关闭"}.get(official_st, "已流转")
                     terminate_reason = f"官方订单状态已流转为【{st_desc}】"
-
-                # 条件 C: 官方 timeout_time 已经延期至次日或超过正常 2 小时窗口
-                elif official_tt > 0:
-                    local_created_ts = local_ord.get("order_time") or 0
-                    if not local_created_ts and local_ord.get("created_at"):
-                        try:
-                            local_created_ts = int(time.mktime(time.strptime(local_ord["created_at"], "%Y-%m-%d %H:%M:%S")))
-                        except Exception:
-                            pass
-                    # 若官方截止时间距离下单时间超过 3 小时，说明官方已给该单大幅延期 (就餐后顺延至次日)
-                    if local_created_ts > 0 and (official_tt - local_created_ts > 10800):
-                        should_terminate = True
-                        exp_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(official_tt))
-                        terminate_reason = f"官方核销截止时间已顺延至次日 ({exp_time_str})"
 
                 if should_terminate:
                     st_str = "auditing" if official_st == 1 else ("completed" if official_st == 2 else local_ord.get("status", "pending"))

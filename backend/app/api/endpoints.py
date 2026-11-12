@@ -4425,7 +4425,8 @@ async def list_orders(
             orig_rebate = round(raw_orig / 100.0 if raw_orig >= 100 else raw_orig, 2)
 
             raw_redpack = float(o.get("redpack_reward_num", 0) or 0)
-            redpack_reward = round(raw_redpack / 100.0 if raw_redpack >= 100 else raw_redpack, 2)
+            # 官方 redpack_reward_num 单位严格为分，必须统一除以 100.0 转为元
+            redpack_reward = round(raw_redpack / 100.0, 2) if raw_redpack > 0 else 0.0
 
             sp = o.get("store_platform")
             if sp == 3:

@@ -482,8 +482,10 @@ export const OrdersView: React.FC = () => {
       width: 180,
       render: (_: any, row?: Order) => {
         const hasRedpack = Boolean(row?.redpack_reward_num && row.redpack_reward_num > 0);
+        const redpackVal = Number(row?.redpack_reward_num || 0);
+        // 后端入库金额已统一为元 (如 0.04)；若大于等于 100 则兼容历史遗留的分单位
         const redpackAmount = hasRedpack
-          ? ((row!.redpack_reward_num!) > 5 ? (row!.redpack_reward_num!) / 100 : (row!.redpack_reward_num!)).toFixed(2)
+          ? (redpackVal >= 100 ? (redpackVal / 100).toFixed(2) : redpackVal.toFixed(2))
           : null;
         const isPercentOrder =
           row?.order_type === 12 ||
